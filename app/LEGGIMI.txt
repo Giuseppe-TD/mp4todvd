@@ -12,4 +12,6 @@ Serve solo Windows 10/11 (usa il .NET Framework 4.8 gia' incluso).
 Qualita' "Auto" calcola il bitrate per riempire il disco scelto: fino a ~1 h su DVD5
 (~2 h su DVD9) sei al massimo (8000 kbps), oltre scende da solo.
 "Due passate" raddoppia il tempo di codifica ma rende meglio sui film lunghi.
+Sorgente "VHS: mantieni interlacciato" per i rip da VHS/grabber (720x576): il DVD resta
+interlacciato come l'originale, il TV lo gestisce. "Deinterlaccia" se vuoi un video progressivo.
 Piu' video = riprodotti in sequenza, con un capitolo ogni N minuti (tasto next).

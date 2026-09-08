@@ -44,11 +44,12 @@ namespace Mp4ToDvd
         public int DriveIndex;
         public int ChapterMinutes = 5;
         public int BurnSpeedX = 0;         // 0 = massima, altrimenti 2,4,6,8,12,16
+        public int Source = 0;             // 0 normale (progressivo), 1 VHS interlacciata mantieni, 2 VHS interlacciata deinterlaccia (yadif)
     }
 
     public class ProbeInfo
     {
-        public string Path; public double Duration; public double Dar; public int W, H; public bool HasAudio;
+        public string Path; public double Duration; public double Dar; public int W, H; public bool HasAudio; public string FieldOrder = "";
     }
 
     public class Engine
@@ -121,7 +122,7 @@ namespace Mp4ToDvd
         public ProbeInfo Probe(string file)
         {
             var ffprobe = Tool("ffprobe.exe") ?? throw new Exception("ffprobe.exe non trovato nella cartella tools");
-            var v = Capture(ffprobe, "-v error -select_streams v:0 -show_entries stream=width,height,sample_aspect_ratio -of csv=p=0 " + Q(file)).Trim();
+            var v = Capture(ffprobe, "-v error -select_streams v:0 -show_entries stream=width,height,sample_aspect_ratio,field_order -of csv=p=0 " + Q(file)).Trim();
             if (string.IsNullOrWhiteSpace(v)) throw new Exception("nessuna traccia video in " + Path.GetFileName(file));
             var parts = v.Split('\n')[0].Trim().Split(',');
             int w = int.Parse(parts[0]), h = int.Parse(parts[1]);
@@ -135,7 +136,8 @@ namespace Mp4ToDvd
             var d = Capture(ffprobe, "-v error -show_entries format=duration -of csv=p=0 " + Q(file)).Trim();
             double dur = double.Parse(d.Split('\n')[0].Trim(), CultureInfo.InvariantCulture);
             var a1 = Capture(ffprobe, "-v error -select_streams a -show_entries stream=index -of csv=p=0 " + Q(file)).Trim();
-            return new ProbeInfo { Path = file, Duration = dur, Dar = w * sar / h, W = w, H = h, HasAudio = a1.Length > 0 };
+            string fo = parts.Length > 3 ? parts[3].Trim() : "";
+            return new ProbeInfo { Path = file, Duration = dur, Dar = w * sar / h, W = w, H = h, HasAudio = a1.Length > 0, FieldOrder = fo };
         }
 
         // ------------------------------------------------------------ pipeline
@@ -159,13 +161,22 @@ namespace Mp4ToDvd
                 var p = Probe(f);
                 probes.Add(p);
                 total += p.Duration;
-                Log(string.Format("{0}  {1}  {2}x{3}  DAR {4:0.00}  audio: {5}", Path.GetFileName(f), Hms(p.Duration), p.W, p.H, p.Dar, p.HasAudio ? "sì" : "no (aggiungo traccia muta)"));
+                Log(string.Format("{0}  {1}  {2}x{3}  DAR {4:0.00}  audio: {5}{6}", Path.GetFileName(f), Hms(p.Duration), p.W, p.H, p.Dar, p.HasAudio ? "sì" : "no (aggiungo traccia muta)",
+                    (p.FieldOrder == "tt" || p.FieldOrder == "bb" || p.FieldOrder == "tb" || p.FieldOrder == "bt") ? "  interlacciato (" + p.FieldOrder + ")" : ""));
             }
 
             bool wide = job.Aspect == "16:9" || (job.Aspect == "auto" && probes.Any(p => p.Dar > 1.5));
             double tdar = wide ? 16.0 / 9 : 4.0 / 3;
             string aspect = wide ? "16:9" : "4:3";
             string sar = wide ? (job.Ntsc ? "32/27" : "64/45") : (job.Ntsc ? "8/9" : "16/15");
+
+            // 720x576 / 720x480 (o 704x…) a pixel quadrati = cattura DVD-nativa: è già lo schermo pieno, non va scalata né bordata
+            foreach (var p in probes)
+                if ((p.W == 720 || p.W == 704) && p.H == H && Math.Abs(p.Dar - (double)p.W / p.H) < 0.01)
+                {
+                    p.Dar = tdar;
+                    Log(Path.GetFileName(p.Path) + ": " + p.W + "x" + p.H + " nativo DVD, trattato come " + aspect + " a schermo pieno");
+                }
 
             const int audioKbps = 192;
             double cap = (job.Dvd9 ? 8540000000.0 : 4700000000.0) * 0.96;
@@ -176,7 +187,8 @@ namespace Mp4ToDvd
                 if (vkbps > 8000) vkbps = 8000;
                 if (vkbps < 1500) { Log("[!] " + Hms(total) + " totali: troppo per questo disco a qualità decente, vado a " + Math.Max(vkbps, 1000) + " kbps (mosaico). Prova DVD9."); vkbps = Math.Max(vkbps, 1000); }
             }
-            Log(string.Format("Totale {0} -> {1} {2}, {3}, video {4} kbps, audio AC3 {5} kbps{6}", Hms(total), fmt.ToUpper(), aspect, job.Dvd9 ? "DVD9" : "DVD5", vkbps, audioKbps, job.TwoPass ? ", 2 passate" : ""));
+            Log(string.Format("Totale {0} -> {1} {2}, {3}, video {4} kbps, audio AC3 {5} kbps{6}{7}", Hms(total), fmt.ToUpper(), aspect, job.Dvd9 ? "DVD9" : "DVD5", vkbps, audioKbps, job.TwoPass ? ", 2 passate" : "",
+                job.Source == 1 ? ", sorgente interlacciata mantenuta" : job.Source == 2 ? ", deinterlacciato (yadif)" : ""));
 
             var work = job.WorkDir;
             if (Directory.Exists(work)) Directory.Delete(work, true);
@@ -197,15 +209,26 @@ namespace Mp4ToDvd
                 var p = probes[n];
                 string outFile = Path.Combine(work, string.Format("t{0:00}.mpg", n + 1));
                 int sw, sh;
-                if (p.Dar >= tdar) { sw = W; sh = (int)Math.Round(H * tdar / p.Dar / 2) * 2; }
+                int mult = job.Source == 1 ? 4 : 2;   // interlacciato: altezza multipla di 4 così l'offset del pad è pari e non inverte i campi
+                if (p.Dar >= tdar) { sw = W; sh = (int)Math.Round(H * tdar / p.Dar / mult) * mult; }
                 else { sh = H; sw = (int)Math.Round(W * p.Dar / tdar / 2) * 2; }
-                string vf = string.Format("scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar);
+                string vf, ilFlags = "";
+                if (job.Source == 1)
+                {
+                    bool bff = p.FieldOrder == "bb" || p.FieldOrder == "bt";
+                    vf = string.Format("setfield={5},scale={0}:{1}:flags=lanczos:interl=1,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, bff ? "bff" : "tff");
+                    ilFlags = " -flags +ildct+ilme -alternate_scan 1 -top " + (bff ? "0" : "1");
+                }
+                else if (job.Source == 2)
+                    vf = string.Format("yadif=0:-1:0,scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar);
+                else
+                    vf = string.Format("scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar);
 
                 var common = new StringBuilder();
                 common.Append("-y -hide_banner -loglevel error -nostats -progress pipe:1 -stats_period 1 -i " + Q(p.Path));
                 if (!p.HasAudio) common.Append(" -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -shortest");
-                string video = string.Format(" -target {0}-dvd -map 0:v:0 -vf {1} -aspect {2} -r {3} -g {4} -b:v {5}k -maxrate 8000k -bufsize 1835k -sn -threads 0",
-                    fmt, Q(vf), aspect, fps, gop, vkbps);
+                string video = string.Format(" -target {0}-dvd -map 0:v:0 -vf {1} -aspect {2} -r {3} -g {4}{6} -b:v {5}k -maxrate 8000k -bufsize 1835k -sn -threads 0",
+                    fmt, Q(vf), aspect, fps, gop, vkbps, ilFlags);
                 string audio = string.Format(" -map {0} -c:a ac3 -b:a {1}k -ar 48000 -ac 2", p.HasAudio ? "0:a:0" : "1:a:0", audioKbps);
 
                 string name = Path.GetFileName(p.Path);

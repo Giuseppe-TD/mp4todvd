@@ -16,7 +16,7 @@ namespace Mp4ToDvd
         ListBox lstFiles;
         Button btnAdd, btnRemove, btnUp, btnDown, btnStart, btnCancel;
         RadioButton rbDvd5, rbDvd9, rbPal, rbNtsc, rbAspAuto, rbAsp169, rbAsp43, rbBurn, rbIso, rbFolder;
-        ComboBox cbQuality, cbDrive, cbChapters, cbSpeed;
+        ComboBox cbQuality, cbDrive, cbChapters, cbSpeed, cbSource;
         CheckBox chkTwoPass;
         TextBox txtLabel, txtIso, txtFolder, txtWork, txtLog;
         Button btnIso, btnFolder, btnWork;
@@ -84,7 +84,10 @@ namespace Mp4ToDvd
 
             rbPal = new RadioButton { Text = "PAL  720×576  (Italia)", Checked = true, AutoSize = true };
             rbNtsc = new RadioButton { Text = "NTSC  720×480", AutoSize = true };
-            opts.Controls.Add(Group("Formato", rbPal, rbNtsc), 1, 0);
+            cbSource = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
+            cbSource.Items.AddRange(new object[] { "Sorgente normale", "VHS: mantieni interlacciato", "VHS: deinterlaccia (yadif)" });
+            cbSource.SelectedIndex = 0;
+            opts.Controls.Add(Group("Formato", rbPal, rbNtsc, cbSource), 1, 0);
 
             rbAspAuto = new RadioButton { Text = "Automatico", Checked = true, AutoSize = true };
             rbAsp169 = new RadioButton { Text = "16:9", AutoSize = true };
@@ -306,6 +309,7 @@ namespace Mp4ToDvd
                 ChapterMinutes = new[] { 5, 10, 15, 100000 }[cbChapters.SelectedIndex],
                 DriveIndex = cbDrive.SelectedIndex,
                 BurnSpeedX = new[] { 0, 2, 4, 6, 8, 12, 16 }[cbSpeed.SelectedIndex],
+                Source = cbSource.SelectedIndex,
                 Mode = rbIso.Checked ? OutputMode.Iso : rbFolder.Checked ? OutputMode.Folder : OutputMode.Burn,
                 OutputPath = rbIso.Checked ? txtIso.Text : txtFolder.Text,
             };
