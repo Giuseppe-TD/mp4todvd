@@ -1,0 +1,71 @@
+name: build mp4todvd (Windows)
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dvdauthor:
+    name: dvdauthor.exe (cross-compile mingw)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mingw-w64 flex bison curl
+      - run: bash build/build-dvdauthor.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dvdauthor-exe
+          path: build/out/dvdauthor.exe
+
+  app:
+    name: mp4todvd.exe + pacchetto
+    needs: dvdauthor
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compila l'app (WinForms, .NET Framework 4.8)
+        run: dotnet build app/mp4todvd.csproj -c Release -nologo
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dvdauthor-exe
+          path: pkg/mp4todvd/tools
+
+      - name: Scarica ffmpeg (gyan.dev, essentials)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath ffzip
+          $bin = Get-ChildItem ffzip -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          Copy-Item $bin.FullName pkg/mp4todvd/tools/
+          Copy-Item (Join-Path $bin.DirectoryName ffprobe.exe) pkg/mp4todvd/tools/
+          $lic = Get-ChildItem ffzip -Recurse -Filter LICENSE | Select-Object -First 1
+          if ($lic) { Copy-Item $lic.FullName pkg/mp4todvd/tools/LICENSE-ffmpeg.txt }
+
+      - name: Impacchetta
+        shell: pwsh
+        run: |
+          Copy-Item app/bin/Release/net48/mp4todvd.exe pkg/mp4todvd/
+          Copy-Item app/LEGGIMI.txt pkg/mp4todvd/
+          Get-ChildItem -Recurse pkg | Select-Object FullName, Length
+          Compress-Archive -Path pkg/mp4todvd -DestinationPath mp4todvd-windows.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mp4todvd-windows
+          path: mp4todvd-windows.zip
+
+      - name: Release (solo su tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME mp4todvd-windows.zip --title $env:GITHUB_REF_NAME --notes "mp4todvd per Windows (exe + ffmpeg + dvdauthor)"
