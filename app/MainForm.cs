@@ -41,7 +41,85 @@ namespace Mp4ToDvd
 
             engine = new Engine(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tools"));
             Build();
+            LoadSettings();
             CheckTools();
+            FormClosing += (s, e) =>
+            {
+                if (running && MessageBox.Show(this, "Conversione in corso: vuoi davvero uscire?", "mp4todvd", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) { e.Cancel = true; return; }
+                engine.Cancel();
+                SaveSettings();
+            };
+        }
+
+        // ------------------------------------------------------------ impostazioni (%APPDATA%\mp4todvd\settings.ini)
+        static string SettingsPath => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "mp4todvd", "settings.ini");
+
+        void SaveSettings()
+        {
+            try
+            {
+                var b = Rectangle.Empty;
+                b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+                var kv = new Dictionary<string, string>
+                {
+                    ["dvd9"] = rbDvd9.Checked ? "1" : "0",
+                    ["ntsc"] = rbNtsc.Checked ? "1" : "0",
+                    ["source"] = cbSource.SelectedIndex.ToString(),
+                    ["aspect"] = rbAsp169.Checked ? "169" : rbAsp43.Checked ? "43" : "auto",
+                    ["quality"] = cbQuality.SelectedIndex.ToString(),
+                    ["twopass"] = chkTwoPass.Checked ? "1" : "0",
+                    ["chapters"] = cbChapters.SelectedIndex.ToString(),
+                    ["mode"] = rbIso.Checked ? "iso" : rbFolder.Checked ? "folder" : "burn",
+                    ["drive"] = cbDrive.SelectedIndex.ToString(),
+                    ["speed"] = cbSpeed.SelectedIndex.ToString(),
+                    ["work"] = txtWork.Text,
+                    ["win.x"] = b.X.ToString(), ["win.y"] = b.Y.ToString(), ["win.w"] = b.Width.ToString(), ["win.h"] = b.Height.ToString(),
+                    ["win.max"] = WindowState == FormWindowState.Maximized ? "1" : "0",
+                };
+                Directory.CreateDirectory(Path.GetDirectoryName(SettingsPath));
+                File.WriteAllLines(SettingsPath, kv.Select(x => x.Key + "=" + x.Value));
+            }
+            catch { }
+        }
+
+        void LoadSettings()
+        {
+            try
+            {
+                if (!File.Exists(SettingsPath)) return;
+                var kv = new Dictionary<string, string>();
+                foreach (var line in File.ReadAllLines(SettingsPath))
+                {
+                    int i = line.IndexOf('=');
+                    if (i > 0) kv[line.Substring(0, i)] = line.Substring(i + 1);
+                }
+                Func<string, int, int> I = (k, d) => { int v; return kv.ContainsKey(k) && int.TryParse(kv[k], out v) ? v : d; };
+                Func<string, string, string> S = (k, d) => kv.ContainsKey(k) ? kv[k] : d;
+                Action<ComboBox, int> Sel = (cb, v) => { if (v >= 0 && v < cb.Items.Count) cb.SelectedIndex = v; };
+
+                rbDvd9.Checked = I("dvd9", 0) == 1; rbDvd5.Checked = !rbDvd9.Checked;
+                rbNtsc.Checked = I("ntsc", 0) == 1; rbPal.Checked = !rbNtsc.Checked;
+                Sel(cbSource, I("source", 1));
+                var a = S("aspect", "auto"); rbAsp169.Checked = a == "169"; rbAsp43.Checked = a == "43"; rbAspAuto.Checked = !(rbAsp169.Checked || rbAsp43.Checked);
+                Sel(cbQuality, I("quality", 0));
+                chkTwoPass.Checked = I("twopass", 0) == 1;
+                Sel(cbChapters, I("chapters", 0));
+                var mode = S("mode", "burn"); rbIso.Checked = mode == "iso"; rbFolder.Checked = mode == "folder"; rbBurn.Checked = !(rbIso.Checked || rbFolder.Checked);
+                Sel(cbDrive, I("drive", 0));
+                Sel(cbSpeed, I("speed", 0));
+                var w = S("work", ""); if (!string.IsNullOrWhiteSpace(w)) txtWork.Text = w;
+
+                int x = I("win.x", int.MinValue), y = I("win.y", int.MinValue), ww = I("win.w", 0), wh = I("win.h", 0);
+                if (ww >= MinimumSize.Width && wh >= MinimumSize.Height)
+                {
+                    var r = new Rectangle(x, y, ww, wh);
+                    if (x != int.MinValue && Screen.AllScreens.Any(sc => sc.WorkingArea.IntersectsWith(r)))
+                    { StartPosition = FormStartPosition.Manual; Bounds = r; }
+                    else Size = new Size(ww, wh);
+                }
+                if (I("win.max", 0) == 1) WindowState = FormWindowState.Maximized;
+            }
+            catch { }
         }
 
         // ------------------------------------------------------------ layout
@@ -86,7 +164,7 @@ namespace Mp4ToDvd
             rbNtsc = new RadioButton { Text = "NTSC  720×480", AutoSize = true };
             cbSource = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
             cbSource.Items.AddRange(new object[] { "Sorgente normale", "VHS: mantieni interlacciato", "VHS: deinterlaccia (yadif)" });
-            cbSource.SelectedIndex = 0;
+            cbSource.SelectedIndex = 1;   // default: VHS mantieni interlacciato
             opts.Controls.Add(Group("Formato", rbPal, rbNtsc, cbSource), 1, 0);
 
             rbAspAuto = new RadioButton { Text = "Automatico", Checked = true, AutoSize = true };
