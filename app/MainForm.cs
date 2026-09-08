@@ -14,7 +14,7 @@ namespace Mp4ToDvd
         static readonly string[] VideoExt = { ".mp4", ".mkv", ".avi", ".mov", ".m4v", ".wmv", ".mpg", ".mpeg", ".ts", ".m2ts", ".webm", ".flv", ".3gp", ".vob" };
 
         ListBox lstFiles;
-        Button btnAdd, btnRemove, btnUp, btnDown, btnStart, btnCancel;
+        Button btnAdd, btnRemove, btnUp, btnDown, btnStart, btnCancel, btnPreview;
         RadioButton rbDvd5, rbDvd9, rbPal, rbNtsc, rbAspAuto, rbAsp169, rbAsp43, rbBurn, rbIso, rbFolder;
         ComboBox cbQuality, cbDrive, cbChapters, cbSpeed, cbSource;
         CheckBox chkTwoPass;
@@ -143,11 +143,13 @@ namespace Mp4ToDvd
             btnRemove = new Button { Text = "Rimuovi", Width = 100 };
             btnUp = new Button { Text = "▲ Su", Width = 100 };
             btnDown = new Button { Text = "▼ Giù", Width = 100 };
+            btnPreview = new Button { Text = "Anteprima", Width = 100, Margin = new Padding(3, 14, 3, 3) };
+            btnPreview.Click += (s, e) => ShowPreview();
             btnAdd.Click += (s, e) => { using (var d = new OpenFileDialog { Multiselect = true, Filter = "Video|" + string.Join(";", VideoExt.Select(x => "*" + x)) + "|Tutti i file|*.*" }) if (d.ShowDialog(this) == DialogResult.OK) AddPaths(d.FileNames); };
             btnRemove.Click += (s, e) => { foreach (var i in lstFiles.SelectedIndices.Cast<int>().OrderByDescending(i => i).ToList()) lstFiles.Items.RemoveAt(i); UpdateEstimate(); };
             btnUp.Click += (s, e) => MoveItems(-1);
             btnDown.Click += (s, e) => MoveItems(1);
-            fb.Controls.AddRange(new Control[] { btnAdd, btnRemove, btnUp, btnDown });
+            fb.Controls.AddRange(new Control[] { btnAdd, btnRemove, btnUp, btnDown, btnPreview });
             tf.Controls.Add(lstFiles, 0, 0); tf.Controls.Add(fb, 1, 0);
             gFiles.Controls.Add(tf);
             root.Controls.Add(gFiles, 0, 0);
@@ -370,11 +372,9 @@ namespace Mp4ToDvd
             if (c is Button || c is RadioButton || c is CheckBox || c is ComboBox || c is TextBox || c is ListBox) c.Enabled = en;
         }
 
-        // ------------------------------------------------------------ run
-        void Start()
+        Job BuildJob()
         {
-            if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-            var job = new Job
+            return new Job
             {
                 Files = lstFiles.Items.Cast<string>().ToList(),
                 Dvd9 = rbDvd9.Checked,
@@ -391,6 +391,21 @@ namespace Mp4ToDvd
                 Mode = rbIso.Checked ? OutputMode.Iso : rbFolder.Checked ? OutputMode.Folder : OutputMode.Burn,
                 OutputPath = rbIso.Checked ? txtIso.Text : txtFolder.Text,
             };
+        }
+
+        void ShowPreview()
+        {
+            if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            string file = lstFiles.SelectedItem as string ?? (string)lstFiles.Items[0];
+            var job = BuildJob();
+            using (var f = new PreviewForm(engine, job, file)) f.ShowDialog(this);
+        }
+
+        // ------------------------------------------------------------ run
+        void Start()
+        {
+            if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            var job = BuildJob();
             if (job.Mode == OutputMode.Iso && string.IsNullOrWhiteSpace(job.OutputPath)) { MessageBox.Show(this, "Indica dove salvare la ISO.", "mp4todvd"); return; }
             if (job.Mode == OutputMode.Folder && string.IsNullOrWhiteSpace(job.OutputPath)) { MessageBox.Show(this, "Indica la cartella di destinazione.", "mp4todvd"); return; }
             if (job.Mode == OutputMode.Burn && Engine.ListRecorders().Count == 0) { MessageBox.Show(this, "Nessun masterizzatore trovato: scegli ISO o cartella.", "mp4todvd"); return; }

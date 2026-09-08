@@ -166,35 +166,14 @@ namespace Mp4ToDvd
             return new[] { cw, ch, x1 & ~1, y1 & ~1 };
         }
 
-        // ------------------------------------------------------------ pipeline
-        public string Execute(Job job)
+        public class PlanResult { public bool Wide; public double Tdar; public string Aspect; public string Sar; }
+
+        // decide per ogni file modalità effettiva, ritaglio e DAR; poi l'aspetto globale del disco
+        PlanResult Plan(Job job, List<ProbeInfo> probes, string ffmpeg, int H)
         {
-            cancelled = false;
-            var ffmpeg = Tool("ffmpeg.exe") ?? throw new Exception("ffmpeg.exe non trovato nella cartella tools");
-            var dvdauthor = Tool("dvdauthor.exe") ?? throw new Exception("dvdauthor.exe non trovato nella cartella tools");
-            if (job.Files.Count == 0) throw new Exception("nessun file");
-
-            string fmt = job.Ntsc ? "ntsc" : "pal";
-            int W = 720, H = job.Ntsc ? 480 : 576;
-            string fps = job.Ntsc ? "30000/1001" : "25";
-            string gop = job.Ntsc ? "18" : "15";
-
-            Progress(-1, "Analisi file...");
-            var probes = new List<ProbeInfo>();
-            double total = 0;
-            foreach (var f in job.Files)
-            {
-                var p = Probe(f);
-                probes.Add(p);
-                total += p.Duration;
-                Log(string.Format("{0}  {1}  {2}x{3}  DAR {4:0.00}  audio: {5}{6}", Path.GetFileName(f), Hms(p.Duration), p.W, p.H, p.Dar, p.HasAudio ? "sì" : "no (aggiungo traccia muta)",
-                    (p.FieldOrder == "tt" || p.FieldOrder == "bb" || p.FieldOrder == "tb" || p.FieldOrder == "bt") ? "  interlacciato (" + p.FieldOrder + ")" : ""));
-            }
-
-            // modalità per file
             foreach (var p in probes)
             {
-                p.Mode = job.Source;
+                p.Mode = job.Source; p.Crop = null;
                 if (job.Source == 4)
                 {
                     p.Mode = 3;   // niente ritaglio: il fotogramma resta com'è (bande comprese), ridotto a 720x576 e deinterlacciato
@@ -236,6 +215,93 @@ namespace Mp4ToDvd
                     Log(Path.GetFileName(p.Path) + ": " + ew + "x" + eh + " nativo DVD, trattato come " + aspect + " a schermo pieno");
                 }
             }
+            return new PlanResult { Wide = wide, Tdar = tdar, Aspect = aspect, Sar = sar };
+        }
+
+        // catena di filtri video per un file (identica per conversione e anteprima)
+        static string BuildFilter(ProbeInfo p, int W, int H, double tdar, string sar, out string ilFlags)
+        {
+            int sw, sh;
+            int mult = p.Mode == 2 ? 4 : 2;   // interlacciato: altezza multipla di 4 così l'offset del pad è pari e non inverte i campi
+            if (p.Dar >= tdar) { sw = W; sh = (int)Math.Round(H * tdar / p.Dar / mult) * mult; }
+            else { sh = H; sw = (int)Math.Round(W * p.Dar / tdar / 2) * 2; }
+            ilFlags = "";
+            string crop = p.Crop != null ? "crop=" + p.Crop + "," : "";
+            if (p.Mode == 2)
+            {
+                bool bff = p.FieldOrder == "bb" || p.FieldOrder == "bt";
+                ilFlags = " -flags +ildct+ilme -alternate_scan 1";   // ordine dei campi dal filtro setfield (l'opzione -top non esiste più in ffmpeg 9)
+                return string.Format("{6}setfield={5},scale={0}:{1}:flags=lanczos:interl=1,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, bff ? "bff" : "tff", crop);
+            }
+            if (p.Mode == 3)
+            {
+                // sorgente già riscalata (OBS): prima riporto alle righe originali, poi deinterlaccio; sorgente nativa: deinterlaccio subito
+                bool rescaled = p.Crop != null || p.H != H;
+                return rescaled
+                    ? string.Format("{5}scale={0}:{1}:flags=lanczos,yadif=0:-1:0,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop)
+                    : string.Format("{5}yadif=0:-1:0,scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop);
+            }
+            return string.Format("{5}scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop);
+        }
+
+        // ------------------------------------------------------------ anteprima: un fotogramma come uscirà sul TV
+        public class PreviewResult { public string PngPath; public string Info; public double Duration; public int DisplayW, DisplayH; }
+
+        public PreviewResult Preview(Job job, string file, double atSec, string pngPath)
+        {
+            cancelled = false;
+            var ffmpeg = Tool("ffmpeg.exe") ?? throw new Exception("ffmpeg.exe non trovato nella cartella tools");
+            int W = 720, H = job.Ntsc ? 480 : 576;
+            var oldLog = Log; Log = s => { };   // niente rumore nel log principale
+            try
+            {
+                var p = Probe(file);
+                var probes = new List<ProbeInfo> { p };
+                var plan = Plan(job, probes, ffmpeg, H);
+                string il;
+                string vf = BuildFilter(p, W, H, plan.Tdar, plan.Sar, out il);
+                int dispW = plan.Wide ? (int)Math.Round(H * 16.0 / 9) : (int)Math.Round(H * 4.0 / 3);
+                // per l'anteprima deinterlaccio sempre (un fotogramma interlacciato a schermo sarebbe "pettinato") e porto a pixel quadrati
+                string preview = vf + (p.Mode == 2 ? ",yadif=0:-1:0" : "") + string.Format(",scale={0}:{1}:flags=lanczos,setsar=1", dispW, H);
+                double t = Math.Max(0, Math.Min(atSec, Math.Max(0, p.Duration - 0.5)));
+                var err = new StringBuilder();
+                int code = Run(ffmpeg, string.Format(CultureInfo.InvariantCulture, "-y -hide_banner -loglevel error -ss {0:0.###} -i {1} -an -sn -frames:v 1 -vf {2} -f image2 {3}",
+                    t, Q(file), Q(preview), Q(pngPath)), null, l => err.AppendLine(l));
+                if (code != 0 || !File.Exists(pngPath)) throw new Exception("anteprima fallita:\n" + err);
+                string modo = p.Mode == 2 ? "interlacciato mantenuto" : p.Mode == 3 ? "deinterlacciato" : "progressivo";
+                string info = string.Format("{0}x{1} -> DVD {2}x{3} {4} ({5}){6}", p.W, p.H, W, H, plan.Aspect, modo, p.Crop != null ? ", ritaglio " + p.Crop.Replace(':', 'x') : "");
+                return new PreviewResult { PngPath = pngPath, Info = info, Duration = p.Duration, DisplayW = dispW, DisplayH = H };
+            }
+            finally { Log = oldLog; }
+        }
+
+        // ------------------------------------------------------------ pipeline
+        public string Execute(Job job)
+        {
+            cancelled = false;
+            var ffmpeg = Tool("ffmpeg.exe") ?? throw new Exception("ffmpeg.exe non trovato nella cartella tools");
+            var dvdauthor = Tool("dvdauthor.exe") ?? throw new Exception("dvdauthor.exe non trovato nella cartella tools");
+            if (job.Files.Count == 0) throw new Exception("nessun file");
+
+            string fmt = job.Ntsc ? "ntsc" : "pal";
+            int W = 720, H = job.Ntsc ? 480 : 576;
+            string fps = job.Ntsc ? "30000/1001" : "25";
+            string gop = job.Ntsc ? "18" : "15";
+
+            Progress(-1, "Analisi file...");
+            var probes = new List<ProbeInfo>();
+            double total = 0;
+            foreach (var f in job.Files)
+            {
+                var p = Probe(f);
+                probes.Add(p);
+                total += p.Duration;
+                Log(string.Format("{0}  {1}  {2}x{3}  DAR {4:0.00}  audio: {5}{6}", Path.GetFileName(f), Hms(p.Duration), p.W, p.H, p.Dar, p.HasAudio ? "sì" : "no (aggiungo traccia muta)",
+                    (p.FieldOrder == "tt" || p.FieldOrder == "bb" || p.FieldOrder == "tb" || p.FieldOrder == "bt") ? "  interlacciato (" + p.FieldOrder + ")" : ""));
+            }
+
+            var plan = Plan(job, probes, ffmpeg, H);
+            bool wide = plan.Wide; double tdar = plan.Tdar; string aspect = plan.Aspect; string sar = plan.Sar;
 
             const int audioKbps = 192;
             double cap = (job.Dvd9 ? 8540000000.0 : 4700000000.0) * 0.96;
@@ -267,28 +333,8 @@ namespace Mp4ToDvd
             {
                 var p = probes[n];
                 string outFile = Path.Combine(work, string.Format("t{0:00}.mpg", n + 1));
-                int sw, sh;
-                int mult = p.Mode == 2 ? 4 : 2;   // interlacciato: altezza multipla di 4 così l'offset del pad è pari e non inverte i campi
-                if (p.Dar >= tdar) { sw = W; sh = (int)Math.Round(H * tdar / p.Dar / mult) * mult; }
-                else { sh = H; sw = (int)Math.Round(W * p.Dar / tdar / 2) * 2; }
-                string vf, ilFlags = "";
-                string crop = p.Crop != null ? "crop=" + p.Crop + "," : "";
-                if (p.Mode == 2)
-                {
-                    bool bff = p.FieldOrder == "bb" || p.FieldOrder == "bt";
-                    vf = string.Format("{6}setfield={5},scale={0}:{1}:flags=lanczos:interl=1,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, bff ? "bff" : "tff", crop);
-                    ilFlags = " -flags +ildct+ilme -alternate_scan 1";   // ordine dei campi dal filtro setfield (l'opzione -top non esiste più in ffmpeg 9)
-                }
-                else if (p.Mode == 3)
-                {
-                    // sorgente già riscalata (OBS): prima riporto alle righe originali, poi deinterlaccio; sorgente nativa: deinterlaccio subito
-                    bool rescaled = p.Crop != null || p.H != H;
-                    vf = rescaled
-                        ? string.Format("{5}scale={0}:{1}:flags=lanczos,yadif=0:-1:0,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop)
-                        : string.Format("{5}yadif=0:-1:0,scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop);
-                }
-                else
-                    vf = string.Format("{5}scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop);
+                string ilFlags;
+                string vf = BuildFilter(p, W, H, tdar, sar, out ilFlags);
 
                 var common = new StringBuilder();
                 common.Append("-y -hide_banner -loglevel error -nostats -progress pipe:1 -stats_period 1 -i " + Q(p.Path));

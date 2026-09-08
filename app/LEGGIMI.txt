@@ -7,7 +7,8 @@ Serve solo Windows 10/11 (usa il .NET Framework 4.8 gia' incluso).
 2. Aggiungi i video (o trascinali nella lista), mettili in ordine.
 3. Scegli DVD5 / DVD9, PAL / NTSC, aspetto, qualita'.
 4. Uscita: masterizza direttamente, oppure crea una ISO, oppure solo la cartella VIDEO_TS.
-5. Avvia. Se masterizzi, ti chiede il DVD vergine quando serve.
+5. "Anteprima" mostra un fotogramma come uscira' sul TV (cursore per scegliere il punto).
+6. Avvia. Se masterizzi, ti chiede il DVD vergine quando serve.
 
 Qualita' "Auto" calcola il bitrate per riempire il disco scelto: fino a ~1 h su DVD5
 (~2 h su DVD9) sei al massimo (8000 kbps), oltre scende da solo.
