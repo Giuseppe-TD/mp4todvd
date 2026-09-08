@@ -16,7 +16,7 @@ namespace Mp4ToDvd
         ListBox lstFiles;
         Button btnAdd, btnRemove, btnUp, btnDown, btnStart, btnCancel;
         RadioButton rbDvd5, rbDvd9, rbPal, rbNtsc, rbAspAuto, rbAsp169, rbAsp43, rbBurn, rbIso, rbFolder;
-        ComboBox cbQuality, cbDrive, cbChapters;
+        ComboBox cbQuality, cbDrive, cbChapters, cbSpeed;
         CheckBox chkTwoPass;
         TextBox txtLabel, txtIso, txtFolder, txtWork, txtLog;
         Button btnIso, btnFolder, btnWork;
@@ -35,6 +35,7 @@ namespace Mp4ToDvd
             MinimumSize = new Size(700, 640);
             Size = new Size(720, 700);
             AllowDrop = true;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
             DragDrop += (s, e) => AddPaths((string[])e.Data.GetData(DataFormats.FileDrop));
 
@@ -113,7 +114,17 @@ namespace Mp4ToDvd
             cbDrive = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
             var btnRefresh = new Button { Text = "Aggiorna", AutoSize = true };
             btnRefresh.Click += (s, e) => LoadDrives();
-            to.Controls.Add(rbBurn, 0, 0); to.Controls.Add(cbDrive, 1, 0); to.Controls.Add(btnRefresh, 2, 0);
+            var drivePanel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3, Margin = new Padding(0) };
+            drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            cbSpeed = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 120 };
+            cbSpeed.Items.AddRange(new object[] { "Velocità max", "2x (più sicuro)", "4x", "6x", "8x", "12x", "16x" });
+            cbSpeed.SelectedIndex = 0;
+            drivePanel.Controls.Add(cbDrive, 0, 0);
+            drivePanel.Controls.Add(new Label { Text = "a", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(6, 6, 6, 0) }, 1, 0);
+            drivePanel.Controls.Add(cbSpeed, 2, 0);
+            to.Controls.Add(rbBurn, 0, 0); to.Controls.Add(drivePanel, 1, 0); to.Controls.Add(btnRefresh, 2, 0);
 
             rbIso = new RadioButton { Text = "Crea file ISO", AutoSize = true, Anchor = AnchorStyles.Left };
             txtIso = new TextBox { Dock = DockStyle.Fill };
@@ -139,7 +150,7 @@ namespace Mp4ToDvd
 
             EventHandler modeChanged = (s, e) =>
             {
-                cbDrive.Enabled = rbBurn.Checked;
+                cbDrive.Enabled = cbSpeed.Enabled = rbBurn.Checked;
                 txtIso.Enabled = btnIso.Enabled = rbIso.Checked;
                 txtFolder.Enabled = btnFolder.Enabled = rbFolder.Checked;
             };
@@ -294,6 +305,7 @@ namespace Mp4ToDvd
                 WorkDir = txtWork.Text,
                 ChapterMinutes = new[] { 5, 10, 15, 100000 }[cbChapters.SelectedIndex],
                 DriveIndex = cbDrive.SelectedIndex,
+                BurnSpeedX = new[] { 0, 2, 4, 6, 8, 12, 16 }[cbSpeed.SelectedIndex],
                 Mode = rbIso.Checked ? OutputMode.Iso : rbFolder.Checked ? OutputMode.Folder : OutputMode.Burn,
                 OutputPath = rbIso.Checked ? txtIso.Text : txtFolder.Text,
             };

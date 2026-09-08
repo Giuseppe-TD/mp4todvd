@@ -9,9 +9,10 @@
     <AssemblyName>mp4todvd</AssemblyName>
     <RootNamespace>Mp4ToDvd</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
     <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Product>mp4todvd</Product>
     <Company>Tastiere Digitali</Company>
     <AutoGenerateBindingRedirects>false</AutoGenerateBindingRedirects>

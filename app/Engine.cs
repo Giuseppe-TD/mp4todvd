@@ -13,6 +13,20 @@ using System.Threading;
 
 namespace Mp4ToDvd
 {
+    [ComImport, Guid("2735413C-7F64-5B0F-8F00-5D77AFBE261E"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+    public interface DDiscFormat2DataEvents
+    {
+        [DispId(0x200)] void Update([In, MarshalAs(UnmanagedType.IDispatch)] object sender, [In, MarshalAs(UnmanagedType.IDispatch)] object progress);
+    }
+
+    [ComVisible(true), ClassInterface(ClassInterfaceType.None)]
+    public class BurnEventSink : DDiscFormat2DataEvents
+    {
+        readonly Engine engine;
+        public BurnEventSink(Engine e) { engine = e; }
+        public void Update(object sender, object progress) { engine.OnBurnUpdate(progress); }
+    }
+
     public enum OutputMode { Burn, Iso, Folder }
 
     public class Job
@@ -29,6 +43,7 @@ namespace Mp4ToDvd
         public string OutputPath;          // ISO file o cartella destinazione
         public int DriveIndex;
         public int ChapterMinutes = 5;
+        public int BurnSpeedX = 0;         // 0 = massima, altrimenti 2,4,6,8,12,16
     }
 
     public class ProbeInfo
@@ -285,13 +300,42 @@ namespace Mp4ToDvd
                     result = "ISO creata: " + job.OutputPath + "\nTasto destro > Masterizza immagine disco.";
                     break;
                 default:
-                    Burn(dvdDir, label, job.DriveIndex);
+                    Burn(dvdDir, label, job.DriveIndex, job.BurnSpeedX);
                     result = "DVD masterizzato.";
                     break;
             }
             try { if (job.Mode != OutputMode.Folder) Directory.Delete(work, true); else { foreach (var f in Directory.GetFiles(work)) File.Delete(f); Directory.Delete(work); } } catch { }
             Progress(1, "Fatto");
             return result;
+        }
+
+        const double DVD1X = 692.5;   // settori/s a 1x DVD (1385 KiB/s)
+        static string SpeedX(int sectorsPerSec) => (sectorsPerSec / DVD1X).ToString("0.#", CultureInfo.InvariantCulture);
+
+        internal void OnBurnUpdate(object progress)
+        {
+            try
+            {
+                dynamic pr = progress;
+                int action = pr.CurrentAction;
+                long done = pr.SectorsWritten, total = pr.TotalSectors;
+                switch (action)
+                {
+                    case 1: Progress(-1, "Calibrazione potenza laser..."); break;
+                    case 2: Progress(-1, "Formattazione..."); break;
+                    case 3: Progress(-1, "Inizializzo l'hardware..."); break;
+                    case 4: Progress(-1, "Scrivo le informazioni iniziali..."); break;
+                    case 5: Progress(-1, "Verifica..."); break;
+                    case 6:
+                        if (total > 0) Progress((double)done / total, string.Format("Scrivo il disco  {0:0} / {1:0} MB", done * 2048 / 1e6, total * 2048 / 1e6));
+                        break;
+                    case 7: Progress(-1, "Finalizzo il disco (chiusura sessione)..."); break;
+                    case 8: Progress(-1, "Completamento..."); break;
+                    case 9: Progress(-1, "Verifica..."); break;
+                    default: Progress(-1, "Scrittura in corso..."); break;
+                }
+            }
+            catch { }
         }
 
         static string Esc(string s) => s.Replace("&", "&amp;").Replace("\"", "&quot;").Replace("<", "&lt;");
@@ -369,7 +413,7 @@ namespace Mp4ToDvd
             finally { Marshal.FreeHGlobal(pRead); }
         }
 
-        void Burn(string dir, string label, int driveIndex)
+        void Burn(string dir, string label, int driveIndex, int speedX)
         {
             Progress(-1, "Preparo la masterizzazione...");
             dynamic dm = Com("IMAPI2.MsftDiscMaster2");
@@ -396,10 +440,40 @@ namespace Mp4ToDvd
                 Thread.Sleep(5000);
             }
 
+            // velocità
+            try
+            {
+                object[] speeds = fmt.SupportedWriteSpeeds;
+                var list = speeds.Select(o => Convert.ToInt32(o)).OrderBy(x => x).ToList();
+                Log("Velocità supportate con questo disco: " + string.Join(", ", list.Select(x => SpeedX(x) + "x")));
+                if (speedX > 0 && list.Count > 0)
+                {
+                    int want = (int)Math.Round(speedX * DVD1X);
+                    int pick = list.Where(x => x <= want + 50).DefaultIfEmpty(list[0]).Max();
+                    fmt.SetWriteSpeed(pick, false);
+                    Log("Velocità impostata: " + SpeedX(pick) + "x");
+                }
+                else Log("Velocità: massima");
+            }
+            catch (Exception ex) { Log("Velocità non impostabile (" + ex.Message + "), uso la massima"); }
+
             Log("Masterizzo su " + letter + "...");
-            Progress(-1, "Scrittura del disco in corso, non toccare il PC...");
+            Progress(-1, "Preparo l'immagine...");
             dynamic res = BuildImage(dir, label, rec, false);
-            fmt.Write(res.ImageStream);
+
+            BurnEventSink sink = null; IConnectionPoint cp = null; int cookie = 0;
+            try
+            {
+                var cpc = (IConnectionPointContainer)fmt;
+                var iid = typeof(DDiscFormat2DataEvents).GUID;
+                cpc.FindConnectionPoint(ref iid, out cp);
+                sink = new BurnEventSink(this);
+                cp.Advise(sink, out cookie);
+            }
+            catch { cp = null; Progress(-1, "Scrittura del disco in corso, non toccare il PC..."); }
+
+            try { fmt.Write(res.ImageStream); }
+            finally { if (cp != null) { try { cp.Unadvise(cookie); } catch { } } }
             Log("Scrittura completata.");
             try { rec.EjectMedia(); } catch { }
         }
