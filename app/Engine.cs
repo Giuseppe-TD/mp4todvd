@@ -44,12 +44,14 @@ namespace Mp4ToDvd
         public int DriveIndex;
         public int ChapterMinutes = 5;
         public int BurnSpeedX = 0;         // 0 = massima, altrimenti 2,4,6,8,12,16
-        public int Source = 0;             // 0 normale (progressivo), 1 VHS interlacciata mantieni, 2 VHS interlacciata deinterlaccia (yadif)
+        public int Source = 4;             // 0 video normale, 1 VHS da OBS ritaglia (crop auto + 4:3), 2 VHS nativa 720x576 mantieni interlacciato, 3 VHS deinterlaccia (yadif), 4 VHS da OBS lascia com'è (16:9 con bande, deinterlaccia)
     }
 
     public class ProbeInfo
     {
         public string Path; public double Duration; public double Dar; public int W, H; public bool HasAudio; public string FieldOrder = "";
+        public string Crop;      // "w:h:x:y" se rilevate bande nere (modalità OBS)
+        public int Mode;         // modalità effettiva per questo file: 0 normale, 2 mantieni interlacciato, 3 deinterlaccia
     }
 
     public class Engine
@@ -140,6 +142,30 @@ namespace Mp4ToDvd
             return new ProbeInfo { Path = file, Duration = dur, Dar = w * sar / h, W = w, H = h, HasAudio = a1.Length > 0, FieldOrder = fo };
         }
 
+        // ------------------------------------------------------------ rilevamento bande nere (OBS)
+        int[] DetectCrop(string ffmpeg, ProbeInfo p)
+        {
+            int x1 = int.MaxValue, y1 = int.MaxValue, x2 = -1, y2 = -1;
+            int hits = 0;
+            foreach (var frac in new[] { 0.08, 0.25, 0.45, 0.65, 0.85 })
+            {
+                double t = Math.Max(0, p.Duration * frac);
+                string last = null;
+                Run(ffmpeg, string.Format(CultureInfo.InvariantCulture, "-hide_banner -v info -ss {0:0.###} -t 1.5 -i {1} -an -sn -vf cropdetect=limit=24:round=2:reset=0 -f null NUL", t, Q(p.Path)),
+                    null, line => { var m = Regex.Match(line, @"crop=(\d+):(\d+):(\d+):(\d+)"); if (m.Success) last = m.Value; });
+                if (last == null) continue;
+                var m2 = Regex.Match(last, @"crop=(\d+):(\d+):(\d+):(\d+)");
+                int w = int.Parse(m2.Groups[1].Value), h = int.Parse(m2.Groups[2].Value), x = int.Parse(m2.Groups[3].Value), y = int.Parse(m2.Groups[4].Value);
+                if (w < 64 || h < 64) continue;   // scena nera, ignora
+                x1 = Math.Min(x1, x); y1 = Math.Min(y1, y); x2 = Math.Max(x2, x + w); y2 = Math.Max(y2, y + h);
+                hits++;
+            }
+            if (hits == 0) return null;
+            int cw = (x2 - x1) & ~1, ch = (y2 - y1) & ~1;
+            if (cw >= p.W - 8 && ch >= p.H - 8) return null;   // niente bande
+            return new[] { cw, ch, x1 & ~1, y1 & ~1 };
+        }
+
         // ------------------------------------------------------------ pipeline
         public string Execute(Job job)
         {
@@ -165,18 +191,51 @@ namespace Mp4ToDvd
                     (p.FieldOrder == "tt" || p.FieldOrder == "bb" || p.FieldOrder == "tb" || p.FieldOrder == "bt") ? "  interlacciato (" + p.FieldOrder + ")" : ""));
             }
 
-            bool wide = job.Aspect == "16:9" || (job.Aspect == "auto" && probes.Any(p => p.Dar > 1.5));
+            // modalità per file
+            foreach (var p in probes)
+            {
+                p.Mode = job.Source;
+                if (job.Source == 4)
+                {
+                    p.Mode = 3;   // niente ritaglio: il fotogramma resta com'è (bande comprese), ridotto a 720x576 e deinterlacciato
+                    Log(Path.GetFileName(p.Path) + ": lascio il fotogramma com'è (" + p.W + "x" + p.H + ", bande comprese), riduco a 720x" + H + " e deinterlaccio");
+                }
+                if (job.Source == 1)
+                {
+                    Progress(-1, "Cerco le bande nere in " + Path.GetFileName(p.Path) + "...");
+                    var c = DetectCrop(ffmpeg, p);
+                    int cw = p.W, ch = p.H;
+                    if (c != null)
+                    {
+                        p.Crop = string.Format("{0}:{1}:{2}:{3}", c[0], c[1], c[2], c[3]);
+                        cw = c[0]; ch = c[1];
+                        Log(string.Format("{0}: area utile {1}x{2} in posizione {3},{4} (bande nere rimosse)", Path.GetFileName(p.Path), cw, ch, c[2], c[3]));
+                    }
+                    else Log(Path.GetFileName(p.Path) + ": nessuna banda nera rilevata");
+                    bool nativeInside = cw >= 700 && cw <= 724 && Math.Abs(ch - H) <= 4;
+                    p.Mode = nativeInside ? 2 : 3;
+                    p.Dar = (double)cw / ch;
+                    Log(nativeInside ? "  -> dentro c'è un " + cw + "x" + ch + " non scalato: lo tengo interlacciato com'è"
+                                     : "  -> OBS l'ha riscalato (i campi sono già mescolati): riporto a 720x" + H + " e deinterlaccio");
+                }
+            }
+
+            bool wide = job.Aspect == "16:9" || (job.Aspect == "auto" && job.Source != 1 && probes.Any(p => p.Dar > 1.5));
             double tdar = wide ? 16.0 / 9 : 4.0 / 3;
             string aspect = wide ? "16:9" : "4:3";
             string sar = wide ? (job.Ntsc ? "32/27" : "64/45") : (job.Ntsc ? "8/9" : "16/15");
 
             // 720x576 / 720x480 (o 704x…) a pixel quadrati = cattura DVD-nativa: è già lo schermo pieno, non va scalata né bordata
             foreach (var p in probes)
-                if ((p.W == 720 || p.W == 704) && p.H == H && Math.Abs(p.Dar - (double)p.W / p.H) < 0.01)
+            {
+                int ew = p.W, eh = p.H;
+                if (p.Crop != null) { var c = p.Crop.Split(':'); ew = int.Parse(c[0]); eh = int.Parse(c[1]); }
+                if (ew >= 700 && ew <= 724 && Math.Abs(eh - H) <= 4 && Math.Abs(p.Dar - (double)ew / eh) < 0.01)
                 {
                     p.Dar = tdar;
-                    Log(Path.GetFileName(p.Path) + ": " + p.W + "x" + p.H + " nativo DVD, trattato come " + aspect + " a schermo pieno");
+                    Log(Path.GetFileName(p.Path) + ": " + ew + "x" + eh + " nativo DVD, trattato come " + aspect + " a schermo pieno");
                 }
+            }
 
             const int audioKbps = 192;
             double cap = (job.Dvd9 ? 8540000000.0 : 4700000000.0) * 0.96;
@@ -188,7 +247,7 @@ namespace Mp4ToDvd
                 if (vkbps < 1500) { Log("[!] " + Hms(total) + " totali: troppo per questo disco a qualità decente, vado a " + Math.Max(vkbps, 1000) + " kbps (mosaico). Prova DVD9."); vkbps = Math.Max(vkbps, 1000); }
             }
             Log(string.Format("Totale {0} -> {1} {2}, {3}, video {4} kbps, audio AC3 {5} kbps{6}{7}", Hms(total), fmt.ToUpper(), aspect, job.Dvd9 ? "DVD9" : "DVD5", vkbps, audioKbps, job.TwoPass ? ", 2 passate" : "",
-                job.Source == 1 ? ", sorgente interlacciata mantenuta" : job.Source == 2 ? ", deinterlacciato (yadif)" : ""));
+                job.Source == 4 ? ", VHS da OBS com'è" : job.Source == 1 ? ", VHS da OBS ritagliata" : job.Source == 2 ? ", sorgente interlacciata mantenuta" : job.Source == 3 ? ", deinterlacciato (yadif)" : ""));
 
             var work = job.WorkDir;
             if (Directory.Exists(work)) Directory.Delete(work, true);
@@ -209,20 +268,27 @@ namespace Mp4ToDvd
                 var p = probes[n];
                 string outFile = Path.Combine(work, string.Format("t{0:00}.mpg", n + 1));
                 int sw, sh;
-                int mult = job.Source == 1 ? 4 : 2;   // interlacciato: altezza multipla di 4 così l'offset del pad è pari e non inverte i campi
+                int mult = p.Mode == 2 ? 4 : 2;   // interlacciato: altezza multipla di 4 così l'offset del pad è pari e non inverte i campi
                 if (p.Dar >= tdar) { sw = W; sh = (int)Math.Round(H * tdar / p.Dar / mult) * mult; }
                 else { sh = H; sw = (int)Math.Round(W * p.Dar / tdar / 2) * 2; }
                 string vf, ilFlags = "";
-                if (job.Source == 1)
+                string crop = p.Crop != null ? "crop=" + p.Crop + "," : "";
+                if (p.Mode == 2)
                 {
                     bool bff = p.FieldOrder == "bb" || p.FieldOrder == "bt";
-                    vf = string.Format("setfield={5},scale={0}:{1}:flags=lanczos:interl=1,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, bff ? "bff" : "tff");
-                    ilFlags = " -flags +ildct+ilme -alternate_scan 1 -top " + (bff ? "0" : "1");
+                    vf = string.Format("{6}setfield={5},scale={0}:{1}:flags=lanczos:interl=1,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, bff ? "bff" : "tff", crop);
+                    ilFlags = " -flags +ildct+ilme -alternate_scan 1";   // ordine dei campi dal filtro setfield (l'opzione -top non esiste più in ffmpeg 9)
                 }
-                else if (job.Source == 2)
-                    vf = string.Format("yadif=0:-1:0,scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar);
+                else if (p.Mode == 3)
+                {
+                    // sorgente già riscalata (OBS): prima riporto alle righe originali, poi deinterlaccio; sorgente nativa: deinterlaccio subito
+                    bool rescaled = p.Crop != null || p.H != H;
+                    vf = rescaled
+                        ? string.Format("{5}scale={0}:{1}:flags=lanczos,yadif=0:-1:0,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop)
+                        : string.Format("{5}yadif=0:-1:0,scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop);
+                }
                 else
-                    vf = string.Format("scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar);
+                    vf = string.Format("{5}scale={0}:{1}:flags=lanczos,pad={2}:{3}:(ow-iw)/2:(oh-ih)/2,setsar={4}", sw, sh, W, H, sar, crop);
 
                 var common = new StringBuilder();
                 common.Append("-y -hide_banner -loglevel error -nostats -progress pipe:1 -stats_period 1 -i " + Q(p.Path));

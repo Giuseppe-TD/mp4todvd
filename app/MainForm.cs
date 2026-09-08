@@ -99,7 +99,7 @@ namespace Mp4ToDvd
 
                 rbDvd9.Checked = I("dvd9", 0) == 1; rbDvd5.Checked = !rbDvd9.Checked;
                 rbNtsc.Checked = I("ntsc", 0) == 1; rbPal.Checked = !rbNtsc.Checked;
-                Sel(cbSource, I("source", 1));
+                Sel(cbSource, I("source", 4));
                 var a = S("aspect", "auto"); rbAsp169.Checked = a == "169"; rbAsp43.Checked = a == "43"; rbAspAuto.Checked = !(rbAsp169.Checked || rbAsp43.Checked);
                 Sel(cbQuality, I("quality", 0));
                 chkTwoPass.Checked = I("twopass", 0) == 1;
@@ -162,9 +162,9 @@ namespace Mp4ToDvd
 
             rbPal = new RadioButton { Text = "PAL  720×576  (Italia)", Checked = true, AutoSize = true };
             rbNtsc = new RadioButton { Text = "NTSC  720×480", AutoSize = true };
-            cbSource = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
-            cbSource.Items.AddRange(new object[] { "Sorgente normale", "VHS: mantieni interlacciato", "VHS: deinterlaccia (yadif)" });
-            cbSource.SelectedIndex = 1;   // default: VHS mantieni interlacciato
+            cbSource = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 230 };
+            cbSource.Items.AddRange(new object[] { "Video normale (telefono, PC)", "VHS da OBS: ritaglia le bande (4:3)", "VHS nativa 720x576: interlacciato", "VHS: deinterlaccia (yadif)", "VHS da OBS: lascia com'è (16:9 con bande)" });
+            cbSource.SelectedIndex = 4;   // default: VHS da OBS com'è
             opts.Controls.Add(Group("Formato", rbPal, rbNtsc, cbSource), 1, 0);
 
             rbAspAuto = new RadioButton { Text = "Automatico", Checked = true, AutoSize = true };
