@@ -435,7 +435,7 @@ namespace Mp4ToDvd
                     result = "ISO creata: " + job.OutputPath + "\nTasto destro > Masterizza immagine disco.";
                     break;
                 default:
-                    Burn(dvdDir, label, job.DriveIndex, job.BurnSpeedX);
+                    RunSta(() => Burn(dvdDir, label, job.DriveIndex, job.BurnSpeedX));
                     result = "DVD masterizzato.";
                     break;
             }
@@ -447,6 +447,20 @@ namespace Mp4ToDvd
         const double DVD1X = 692.5;   // settori/s a 1x DVD (1385 KiB/s)
         static string SpeedX(int sectorsPerSec) => (sectorsPerSec / DVD1X).ToString("0.#", CultureInfo.InvariantCulture);
 
+        // IMAPI2 è COM "apartment": oggetti ed eventi devono vivere su un thread STA, altrimenti le notifiche di avanzamento non arrivano
+        static void RunSta(Action a)
+        {
+            Exception err = null;
+            var t = new Thread(() => { try { a(); } catch (Exception ex) { err = ex; } });
+            t.SetApartmentState(ApartmentState.STA);
+            t.IsBackground = true;
+            t.Start();
+            t.Join();
+            if (err != null) throw err;
+        }
+
+        DateTime burnStart; long burnFirstSectors = -1; bool burnEventSeen;
+
         internal void OnBurnUpdate(object progress)
         {
             try
@@ -454,19 +468,32 @@ namespace Mp4ToDvd
                 dynamic pr = progress;
                 int action = pr.CurrentAction;
                 long done = pr.SectorsWritten, total = pr.TotalSectors;
+                if (!burnEventSeen) { burnEventSeen = true; Log("Avanzamento masterizzazione attivo."); }
                 switch (action)
                 {
                     case 1: Progress(-1, "Calibrazione potenza laser..."); break;
-                    case 2: Progress(-1, "Formattazione..."); break;
-                    case 3: Progress(-1, "Inizializzo l'hardware..."); break;
-                    case 4: Progress(-1, "Scrivo le informazioni iniziali..."); break;
+                    case 2: Progress(-1, "Formattazione del disco..."); break;
+                    case 3: Progress(-1, "Inizializzo il masterizzatore..."); break;
+                    case 4: Progress(-1, "Scrivo le informazioni iniziali (lead-in)..."); break;
                     case 5: Progress(-1, "Verifica..."); break;
                     case 6:
-                        if (total > 0) Progress((double)done / total, string.Format("Scrivo il disco  {0:0} / {1:0} MB", done * 2048 / 1e6, total * 2048 / 1e6));
+                        if (total > 0)
+                        {
+                            if (burnFirstSectors < 0) { burnFirstSectors = done; burnStart = DateTime.Now; }
+                            double secs = (DateTime.Now - burnStart).TotalSeconds;
+                            string extra = "";
+                            if (secs > 3 && done > burnFirstSectors)
+                            {
+                                double sectorsPerSec = (done - burnFirstSectors) / secs;
+                                double eta = (total - done) / sectorsPerSec;
+                                extra = string.Format("  —  {0:0.0}x, restano ~{1}", sectorsPerSec / DVD1X, Hms(eta));
+                            }
+                            Progress((double)done / total, string.Format("Scrivo il disco  {0:0} / {1:0} MB{2}", done * 2048 / 1e6, total * 2048 / 1e6, extra));
+                        }
                         break;
-                    case 7: Progress(-1, "Finalizzo il disco (chiusura sessione)..."); break;
+                    case 7: Progress(-1, "Finalizzo il disco (chiusura sessione, 1-2 minuti)..."); break;
                     case 8: Progress(-1, "Completamento..."); break;
-                    case 9: Progress(-1, "Verifica..."); break;
+                    case 9: Progress(-1, "Verifica dei dati..."); break;
                     default: Progress(-1, "Scrittura in corso..."); break;
                 }
             }
@@ -597,6 +624,7 @@ namespace Mp4ToDvd
             dynamic res = BuildImage(dir, label, rec, false);
 
             BurnEventSink sink = null; IConnectionPoint cp = null; int cookie = 0;
+            burnFirstSectors = -1; burnEventSeen = false;
             try
             {
                 var cpc = (IConnectionPointContainer)fmt;
@@ -605,8 +633,10 @@ namespace Mp4ToDvd
                 sink = new BurnEventSink(this);
                 cp.Advise(sink, out cookie);
             }
-            catch { cp = null; Progress(-1, "Scrittura del disco in corso, non toccare il PC..."); }
+            catch (Exception ex) { cp = null; Log("Eventi di avanzamento non disponibili (" + ex.Message + "): scrivo senza percentuale."); }
 
+            long totalMB = 0; try { totalMB = (long)res.TotalBlocks * 2048L / 1000000L; } catch { }
+            Progress(-1, "Scrittura del disco in corso (" + totalMB + " MB)...");
             try { fmt.Write(res.ImageStream); }
             finally { if (cp != null) { try { cp.Unadvise(cookie); } catch { } } }
             Log("Scrittura completata.");
