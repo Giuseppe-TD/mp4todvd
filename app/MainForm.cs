@@ -169,6 +169,7 @@ namespace Mp4ToDvd
             tf.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             tf.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             lstFiles = new ListBox { Dock = DockStyle.Fill, SelectionMode = SelectionMode.MultiExtended, IntegralHeight = false, HorizontalScrollbar = true, AllowDrop = true };
+            lstFiles.MouseDown += (s, e) => { if (running) { lstFiles.ClearSelected(); } };
             lstFiles.DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
             lstFiles.DragDrop += (s, e) => AddPaths((string[])e.Data.GetData(DataFormats.FileDrop));
             lstFiles.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete) RemoveSelected(); };
@@ -375,6 +376,7 @@ namespace Mp4ToDvd
 
         void AddPaths(IEnumerable<string> paths)
         {
+            if (running) return;
             var added = new List<FileItem>();
             foreach (var p in paths)
             {
@@ -406,6 +408,7 @@ namespace Mp4ToDvd
 
         void RemoveSelected()
         {
+            if (running) return;
             foreach (var i in lstFiles.SelectedIndices.Cast<int>().OrderByDescending(i => i).ToList()) lstFiles.Items.RemoveAt(i);
             RefreshAutoNames();
             UpdateEstimate();
@@ -413,6 +416,7 @@ namespace Mp4ToDvd
 
         void MoveItems(int dir)
         {
+            if (running) return;
             var idx = lstFiles.SelectedIndices.Cast<int>().OrderBy(i => dir < 0 ? i : -i).ToList();
             foreach (var i in idx)
             {
@@ -527,12 +531,15 @@ namespace Mp4ToDvd
             else
             {
                 btnBurnAgain.Enabled = false;
+                lstFiles.ClearSelected();   // niente riga blu: i nomi restano leggibili durante il lavoro
                 SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);   // niente standby durante il lavoro
             }
         }
         void SetEnabledDeep(Control c, bool en)
         {
-            if (c == txtLog || c == prg || c == lblStatus || c == btnCancel || c == btnCopyLog) return;
+            // la lista resta abilitata (disabilitata Windows la disegna grigia e i nomi non si leggono):
+            // le modifiche sono già bloccate dal flag "running"
+            if (c == txtLog || c == prg || c == lblStatus || c == btnCancel || c == btnCopyLog || c == lstFiles) return;
             if (c.HasChildren) foreach (Control k in c.Controls) SetEnabledDeep(k, en);
             if (c is Button || c is RadioButton || c is CheckBox || c is ComboBox || c is TextBox || c is ListBox || c is NumericUpDown) c.Enabled = en;
         }
@@ -568,6 +575,7 @@ namespace Mp4ToDvd
 
         void ShowPreview()
         {
+            if (running) return;
             if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
             string file = (lstFiles.SelectedItem as FileItem ?? Items.First()).Path;
             var job = BuildJob();
