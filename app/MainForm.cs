@@ -3,28 +3,48 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Media;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace Mp4ToDvd
 {
+    // voce della lista: percorso + durata (letta in background)
+    public class FileItem
+    {
+        public string Path; public double Duration = -1;
+        public override string ToString()
+        {
+            string d = Duration < 0 ? "…" : Duration == 0 ? "?" : Engine.FormatHms(Duration);
+            return System.IO.Path.GetFileName(Path) + "   [" + d + "]";
+        }
+    }
+
     public class MainForm : Form
     {
         static readonly string[] VideoExt = { ".mp4", ".mkv", ".avi", ".mov", ".m4v", ".wmv", ".mpg", ".mpeg", ".ts", ".m2ts", ".webm", ".flv", ".3gp", ".vob" };
 
         ListBox lstFiles;
-        Button btnAdd, btnRemove, btnUp, btnDown, btnStart, btnCancel, btnPreview;
+        Button btnAdd, btnRemove, btnUp, btnDown, btnStart, btnCancel, btnPreview, btnBurnAgain, btnCopyLog;
         RadioButton rbDvd5, rbDvd9, rbPal, rbNtsc, rbAspAuto, rbAsp169, rbAsp43, rbBurn, rbIso, rbFolder;
-        ComboBox cbQuality, cbDrive, cbChapters, cbSpeed, cbSource;
-        CheckBox chkTwoPass;
-        TextBox txtLabel, txtIso, txtFolder, txtWork, txtLog;
-        Button btnIso, btnFolder, btnWork;
+        ComboBox cbQuality, cbDrive, cbChapters, cbSpeed, cbSource, cbMenuTemplate;
+        CheckBox chkTwoPass, chkMenu;
+        NumericUpDown numCopies;
+        TextBox txtLabel, txtIso, txtFolder, txtWork, txtLog, txtMenuTitle, txtMenuBg;
+        Button btnIso, btnFolder, btnWork, btnMenuBg, btnMenuPreview;
         ProgressBar prg;
         Label lblStatus, lblEstimate;
 
         Engine engine;
         bool running;
+        bool labelAuto = true, isoAuto = true, folderAuto = true, menuTitleAuto = true, settingAuto;
+        string lastDir = "";
+
+        [DllImport("kernel32.dll")] static extern uint SetThreadExecutionState(uint esFlags);
+        const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x00000001;
+        [DllImport("user32.dll")] static extern bool FlashWindow(IntPtr hWnd, bool bInvert);
 
         public MainForm()
         {
@@ -32,8 +52,8 @@ namespace Mp4ToDvd
             Font = new Font("Segoe UI", 9f);
             AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
-            MinimumSize = new Size(700, 640);
-            Size = new Size(720, 700);
+            MinimumSize = new Size(760, 720);
+            Size = new Size(800, 800);
             AllowDrop = true;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
@@ -48,6 +68,7 @@ namespace Mp4ToDvd
                 if (running && MessageBox.Show(this, "Conversione in corso: vuoi davvero uscire?", "mp4todvd", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) { e.Cancel = true; return; }
                 engine.Cancel();
                 SaveSettings();
+                engine.Cleanup();
             };
         }
 
@@ -58,8 +79,7 @@ namespace Mp4ToDvd
         {
             try
             {
-                var b = Rectangle.Empty;
-                b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
+                var b = WindowState == FormWindowState.Normal ? Bounds : RestoreBounds;
                 var kv = new Dictionary<string, string>
                 {
                     ["dvd9"] = rbDvd9.Checked ? "1" : "0",
@@ -72,7 +92,12 @@ namespace Mp4ToDvd
                     ["mode"] = rbIso.Checked ? "iso" : rbFolder.Checked ? "folder" : "burn",
                     ["drive"] = cbDrive.SelectedIndex.ToString(),
                     ["speed"] = cbSpeed.SelectedIndex.ToString(),
+                    ["copies"] = ((int)numCopies.Value).ToString(),
+                    ["menu"] = chkMenu.Checked ? "1" : "0",
+                    ["menu.template"] = cbMenuTemplate.SelectedIndex.ToString(),
+                    ["menu.bg"] = txtMenuBg.Text,
                     ["work"] = txtWork.Text,
+                    ["lastdir"] = lastDir,
                     ["win.x"] = b.X.ToString(), ["win.y"] = b.Y.ToString(), ["win.w"] = b.Width.ToString(), ["win.h"] = b.Height.ToString(),
                     ["win.max"] = WindowState == FormWindowState.Maximized ? "1" : "0",
                 };
@@ -107,7 +132,12 @@ namespace Mp4ToDvd
                 var mode = S("mode", "burn"); rbIso.Checked = mode == "iso"; rbFolder.Checked = mode == "folder"; rbBurn.Checked = !(rbIso.Checked || rbFolder.Checked);
                 Sel(cbDrive, I("drive", 0));
                 Sel(cbSpeed, I("speed", 0));
+                numCopies.Value = Math.Max(1, Math.Min(20, I("copies", 1)));
+                chkMenu.Checked = I("menu", 0) == 1;
+                Sel(cbMenuTemplate, I("menu.template", 0));
+                settingAuto = true; txtMenuBg.Text = S("menu.bg", ""); settingAuto = false;
                 var w = S("work", ""); if (!string.IsNullOrWhiteSpace(w)) txtWork.Text = w;
+                lastDir = S("lastdir", "");
 
                 int x = I("win.x", int.MinValue), y = I("win.y", int.MinValue), ww = I("win.w", 0), wh = I("win.h", 0);
                 if (ww >= MinimumSize.Width && wh >= MinimumSize.Height)
@@ -125,19 +155,24 @@ namespace Mp4ToDvd
         // ------------------------------------------------------------ layout
         void Build()
         {
-            var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10), ColumnCount = 1, RowCount = 4 };
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 42));
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(10), ColumnCount = 1, RowCount = 5 };
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 40));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            root.RowStyles.Add(new RowStyle(SizeType.Percent, 58));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 60));
             Controls.Add(root);
 
             // --- file
-            var gFiles = new GroupBox { Text = "Video (trascina qui i file, in ordine di riproduzione)", Dock = DockStyle.Fill };
+            var gFiles = new GroupBox { Text = "Video (trascina qui i file, in ordine di riproduzione — Canc rimuove, doppio clic = anteprima)", Dock = DockStyle.Fill };
             var tf = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Padding = new Padding(6) };
             tf.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
             tf.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            lstFiles = new ListBox { Dock = DockStyle.Fill, SelectionMode = SelectionMode.MultiExtended, IntegralHeight = false, HorizontalScrollbar = true };
+            lstFiles = new ListBox { Dock = DockStyle.Fill, SelectionMode = SelectionMode.MultiExtended, IntegralHeight = false, HorizontalScrollbar = true, AllowDrop = true };
+            lstFiles.DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
+            lstFiles.DragDrop += (s, e) => AddPaths((string[])e.Data.GetData(DataFormats.FileDrop));
+            lstFiles.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete) RemoveSelected(); };
+            lstFiles.DoubleClick += (s, e) => ShowPreview();
             var fb = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Dock = DockStyle.Fill, WrapContents = false };
             btnAdd = new Button { Text = "Aggiungi...", Width = 100 };
             btnRemove = new Button { Text = "Rimuovi", Width = 100 };
@@ -145,8 +180,15 @@ namespace Mp4ToDvd
             btnDown = new Button { Text = "▼ Giù", Width = 100 };
             btnPreview = new Button { Text = "Anteprima", Width = 100, Margin = new Padding(3, 14, 3, 3) };
             btnPreview.Click += (s, e) => ShowPreview();
-            btnAdd.Click += (s, e) => { using (var d = new OpenFileDialog { Multiselect = true, Filter = "Video|" + string.Join(";", VideoExt.Select(x => "*" + x)) + "|Tutti i file|*.*" }) if (d.ShowDialog(this) == DialogResult.OK) AddPaths(d.FileNames); };
-            btnRemove.Click += (s, e) => { foreach (var i in lstFiles.SelectedIndices.Cast<int>().OrderByDescending(i => i).ToList()) lstFiles.Items.RemoveAt(i); UpdateEstimate(); };
+            btnAdd.Click += (s, e) =>
+            {
+                using (var d = new OpenFileDialog { Multiselect = true, Filter = "Video|" + string.Join(";", VideoExt.Select(x => "*" + x)) + "|Tutti i file|*.*" })
+                {
+                    if (Directory.Exists(lastDir)) d.InitialDirectory = lastDir;
+                    if (d.ShowDialog(this) == DialogResult.OK) { AddPaths(d.FileNames); lastDir = Path.GetDirectoryName(d.FileNames[0]); }
+                }
+            };
+            btnRemove.Click += (s, e) => RemoveSelected();
             btnUp.Click += (s, e) => MoveItems(-1);
             btnDown.Click += (s, e) => MoveItems(1);
             fb.Controls.AddRange(new Control[] { btnAdd, btnRemove, btnUp, btnDown, btnPreview });
@@ -186,6 +228,41 @@ namespace Mp4ToDvd
             cbQuality.SelectedIndexChanged += (s, e) => UpdateEstimate();
             root.Controls.Add(opts, 0, 1);
 
+            // --- menu DVD (opzionale)
+            var gMenu = new GroupBox { Text = "Menu DVD (opzionale)", Dock = DockStyle.Top, AutoSize = true, Margin = new Padding(0, 8, 0, 0) };
+            var tm = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 6, Padding = new Padding(6) };
+            tm.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            tm.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            tm.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            tm.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tm.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            tm.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            chkMenu = new CheckBox { Text = "Menu con scelta dei video", AutoSize = true, Anchor = AnchorStyles.Left };
+            cbMenuTemplate = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 190 };
+            cbMenuTemplate.Items.AddRange(MenuBuilder.Templates);
+            cbMenuTemplate.SelectedIndex = 0;
+            var lblMt = new Label { Text = "Titolo", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(12, 6, 3, 0) };
+            txtMenuTitle = new TextBox { Dock = DockStyle.Fill };
+            btnMenuPreview = new Button { Text = "Anteprima menu", AutoSize = true };
+            btnMenuPreview.Click += (s, e) => ShowMenuPreview();
+            tm.Controls.Add(chkMenu, 0, 0); tm.Controls.Add(cbMenuTemplate, 1, 0); tm.Controls.Add(lblMt, 2, 0); tm.Controls.Add(txtMenuTitle, 3, 0); tm.Controls.Add(btnMenuPreview, 4, 0);
+            var lblBg = new Label { Text = "Immagine di sfondo (solo per \"Immagine personalizzata\")", AutoSize = true, Anchor = AnchorStyles.Left };
+            tm.Controls.Add(lblBg, 0, 1); tm.SetColumnSpan(lblBg, 3);
+            txtMenuBg = new TextBox { Dock = DockStyle.Fill };
+            btnMenuBg = new Button { Text = "Sfoglia...", AutoSize = true };
+            btnMenuBg.Click += (s, e) => { using (var d = new OpenFileDialog { Filter = "Immagini|*.jpg;*.jpeg;*.png;*.bmp" }) if (d.ShowDialog(this) == DialogResult.OK) txtMenuBg.Text = d.FileName; };
+            tm.Controls.Add(txtMenuBg, 3, 1); tm.Controls.Add(btnMenuBg, 4, 1);
+            EventHandler menuChanged = (s, e) =>
+            {
+                bool on = chkMenu.Checked;
+                cbMenuTemplate.Enabled = txtMenuTitle.Enabled = btnMenuPreview.Enabled = on;
+                txtMenuBg.Enabled = btnMenuBg.Enabled = on && cbMenuTemplate.SelectedIndex == 4;
+            };
+            chkMenu.CheckedChanged += menuChanged; cbMenuTemplate.SelectedIndexChanged += menuChanged;
+            menuChanged(null, null);
+            gMenu.Controls.Add(tm);
+            root.Controls.Add(gMenu, 0, 2);
+
             // --- output
             var gOut = new GroupBox { Text = "Uscita", Dock = DockStyle.Top, AutoSize = true, Margin = new Padding(0, 8, 0, 0) };
             var to = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3, Padding = new Padding(6) };
@@ -197,16 +274,18 @@ namespace Mp4ToDvd
             cbDrive = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Dock = DockStyle.Fill };
             var btnRefresh = new Button { Text = "Aggiorna", AutoSize = true };
             btnRefresh.Click += (s, e) => LoadDrives();
-            var drivePanel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 3, Margin = new Padding(0) };
+            var drivePanel = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 6, Margin = new Padding(0) };
             drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            for (int i = 0; i < 5; i++) drivePanel.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             cbSpeed = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 120 };
             cbSpeed.Items.AddRange(new object[] { "Velocità max", "2x (più sicuro)", "4x", "6x", "8x", "12x", "16x" });
             cbSpeed.SelectedIndex = 0;
+            numCopies = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 1, Width = 48 };
             drivePanel.Controls.Add(cbDrive, 0, 0);
             drivePanel.Controls.Add(new Label { Text = "a", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(6, 6, 6, 0) }, 1, 0);
             drivePanel.Controls.Add(cbSpeed, 2, 0);
+            drivePanel.Controls.Add(new Label { Text = "copie", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(10, 6, 4, 0) }, 3, 0);
+            drivePanel.Controls.Add(numCopies, 4, 0);
             to.Controls.Add(rbBurn, 0, 0); to.Controls.Add(drivePanel, 1, 0); to.Controls.Add(btnRefresh, 2, 0);
 
             rbIso = new RadioButton { Text = "Crea file ISO", AutoSize = true, Anchor = AnchorStyles.Left };
@@ -231,16 +310,22 @@ namespace Mp4ToDvd
             btnWork.Click += (s, e) => { using (var d = new FolderBrowserDialog()) if (d.ShowDialog(this) == DialogResult.OK) txtWork.Text = Path.Combine(d.SelectedPath, "mp4todvd"); };
             to.Controls.Add(lblWork, 0, 4); to.Controls.Add(txtWork, 1, 4); to.Controls.Add(btnWork, 2, 4);
 
+            // campi automatici: finché non li tocchi seguono il primo video
+            txtLabel.TextChanged += (s, e) => { if (!settingAuto) labelAuto = txtLabel.Text.Length == 0; };
+            txtIso.TextChanged += (s, e) => { if (!settingAuto) isoAuto = txtIso.Text.Length == 0; };
+            txtFolder.TextChanged += (s, e) => { if (!settingAuto) folderAuto = txtFolder.Text.Length == 0; };
+            txtMenuTitle.TextChanged += (s, e) => { if (!settingAuto) menuTitleAuto = txtMenuTitle.Text.Length == 0; };
+
             EventHandler modeChanged = (s, e) =>
             {
-                cbDrive.Enabled = cbSpeed.Enabled = rbBurn.Checked;
+                cbDrive.Enabled = cbSpeed.Enabled = numCopies.Enabled = rbBurn.Checked;
                 txtIso.Enabled = btnIso.Enabled = rbIso.Checked;
                 txtFolder.Enabled = btnFolder.Enabled = rbFolder.Checked;
             };
             rbBurn.CheckedChanged += modeChanged; rbIso.CheckedChanged += modeChanged; rbFolder.CheckedChanged += modeChanged;
             modeChanged(null, null);
             gOut.Controls.Add(to);
-            root.Controls.Add(gOut, 0, 2);
+            root.Controls.Add(gOut, 0, 3);
 
             // --- avvio + log
             var bottom = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0, 8, 0, 0) };
@@ -249,16 +334,19 @@ namespace Mp4ToDvd
             bottom.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             bottom.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-            var row = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 3 };
+            var row = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 5 };
             row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            for (int i = 0; i < 4; i++) row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             lblEstimate = new Label { Text = "", AutoSize = true, Anchor = AnchorStyles.Left, ForeColor = Color.DimGray };
+            btnCopyLog = new Button { Text = "Copia log", AutoSize = true, Height = 34 };
+            btnCopyLog.Click += (s, e) => { try { if (txtLog.Text.Length > 0) Clipboard.SetText(txtLog.Text); } catch { } };
+            btnBurnAgain = new Button { Text = "Rimasterizza ultimo DVD", AutoSize = true, Height = 34, Enabled = false };
+            btnBurnAgain.Click += (s, e) => BurnAgain();
             btnStart = new Button { Text = "Avvia", Width = 120, Height = 34, Font = new Font("Segoe UI", 10f, FontStyle.Bold) };
             btnCancel = new Button { Text = "Annulla", Width = 100, Height = 34, Enabled = false };
             btnStart.Click += (s, e) => Start();
             btnCancel.Click += (s, e) => { engine.Cancel(); btnCancel.Enabled = false; };
-            row.Controls.Add(lblEstimate, 0, 0); row.Controls.Add(btnStart, 1, 0); row.Controls.Add(btnCancel, 2, 0);
+            row.Controls.Add(lblEstimate, 0, 0); row.Controls.Add(btnCopyLog, 1, 0); row.Controls.Add(btnBurnAgain, 2, 0); row.Controls.Add(btnStart, 3, 0); row.Controls.Add(btnCancel, 4, 0);
             bottom.Controls.Add(row, 0, 0);
 
             prg = new ProgressBar { Dock = DockStyle.Top, Height = 18, Margin = new Padding(0, 6, 0, 2) };
@@ -267,7 +355,7 @@ namespace Mp4ToDvd
             bottom.Controls.Add(lblStatus, 0, 2);
             txtLog = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, Font = new Font("Consolas", 9f), BackColor = Color.White };
             bottom.Controls.Add(txtLog, 0, 3);
-            root.Controls.Add(bottom, 0, 3);
+            root.Controls.Add(bottom, 0, 4);
 
             LoadDrives();
         }
@@ -281,24 +369,45 @@ namespace Mp4ToDvd
             return g;
         }
 
-        // ------------------------------------------------------------ helpers
+        // ------------------------------------------------------------ lista file
         public void AddPathsPublic(IEnumerable<string> paths) => AddPaths(paths);
+        IEnumerable<FileItem> Items => lstFiles.Items.Cast<FileItem>();
+
         void AddPaths(IEnumerable<string> paths)
         {
+            var added = new List<FileItem>();
             foreach (var p in paths)
             {
-                if (Directory.Exists(p))
-                    foreach (var f in Directory.GetFiles(p).Where(f => VideoExt.Contains(Path.GetExtension(f).ToLowerInvariant())).OrderBy(f => f))
-                        if (!lstFiles.Items.Contains(f)) lstFiles.Items.Add(f);
-                if (File.Exists(p) && !lstFiles.Items.Contains(p)) lstFiles.Items.Add(p);
+                var files = new List<string>();
+                if (Directory.Exists(p)) files.AddRange(Directory.GetFiles(p).Where(f => VideoExt.Contains(Path.GetExtension(f).ToLowerInvariant())).OrderBy(f => f));
+                else if (File.Exists(p)) files.Add(p);
+                foreach (var f in files)
+                {
+                    if (Items.Any(x => string.Equals(x.Path, f, StringComparison.OrdinalIgnoreCase))) continue;
+                    var it = new FileItem { Path = f };
+                    lstFiles.Items.Add(it);
+                    added.Add(it);
+                }
             }
-            if (lstFiles.Items.Count > 0)
+            if (added.Count > 0)
             {
-                var first = (string)lstFiles.Items[0];
-                if (string.IsNullOrWhiteSpace(txtIso.Text)) txtIso.Text = Path.ChangeExtension(first, ".iso");
-                if (string.IsNullOrWhiteSpace(txtFolder.Text)) txtFolder.Text = Path.Combine(Path.GetDirectoryName(first), Path.GetFileNameWithoutExtension(first) + "_DVD");
-                if (txtLabel.Text == "DVD_VIDEO") txtLabel.Text = new string(Path.GetFileNameWithoutExtension(first).ToUpperInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '_').Take(32).ToArray());
+                Task.Run(() =>
+                {
+                    foreach (var it in added)
+                    {
+                        it.Duration = engine.QuickDuration(it.Path);
+                        BeginInvoke((Action)(() => { lstFiles.Refresh(); UpdateEstimate(); }));
+                    }
+                });
             }
+            RefreshAutoNames();
+            UpdateEstimate();
+        }
+
+        void RemoveSelected()
+        {
+            foreach (var i in lstFiles.SelectedIndices.Cast<int>().OrderByDescending(i => i).ToList()) lstFiles.Items.RemoveAt(i);
+            RefreshAutoNames();
             UpdateEstimate();
         }
 
@@ -313,6 +422,40 @@ namespace Mp4ToDvd
             }
             lstFiles.ClearSelected();
             foreach (var i in idx) lstFiles.SetSelected(i + dir, true);
+            RefreshAutoNames();
+        }
+
+        static string CleanLabel(string name)
+        {
+            var s = new string(name.ToUpperInvariant().Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
+            while (s.Contains("__")) s = s.Replace("__", "_");
+            s = s.Trim('_');
+            if (s.Length > 32) s = s.Substring(0, 32).TrimEnd('_');
+            return s.Length == 0 ? "DVD_VIDEO" : s;
+        }
+
+        // etichetta / ISO / cartella / titolo menu seguono il primo video finché non li modifichi a mano
+        void RefreshAutoNames()
+        {
+            settingAuto = true;
+            try
+            {
+                if (lstFiles.Items.Count == 0)
+                {
+                    if (labelAuto) txtLabel.Text = "DVD_VIDEO";
+                    if (isoAuto) txtIso.Text = "";
+                    if (folderAuto) txtFolder.Text = "";
+                    if (menuTitleAuto) txtMenuTitle.Text = "";
+                    return;
+                }
+                var first = Items.First().Path;
+                string baseName = Path.GetFileNameWithoutExtension(first).Trim();
+                if (labelAuto) txtLabel.Text = CleanLabel(baseName);
+                if (isoAuto) txtIso.Text = Path.Combine(Path.GetDirectoryName(first), baseName + ".iso");
+                if (folderAuto) txtFolder.Text = Path.Combine(Path.GetDirectoryName(first), baseName + "_DVD");
+                if (menuTitleAuto) txtMenuTitle.Text = MenuBuilder.CleanLabel(first);
+            }
+            finally { settingAuto = false; }
         }
 
         void LoadDrives()
@@ -332,16 +475,27 @@ namespace Mp4ToDvd
                 btnStart.Enabled = false;
             }
             else AppendLog("Pronto. Aggiungi i video e premi Avvia.");
+            if (engine.Tool("spumux.exe") == null) { AppendLog("[!] spumux.exe non trovato: il menu DVD non è disponibile."); chkMenu.Checked = false; chkMenu.Enabled = false; }
         }
 
         void UpdateEstimate()
         {
             int n = lstFiles.Items.Count;
             if (n == 0) { lblEstimate.Text = ""; return; }
-            double cap = rbDvd9.Checked ? 8.5 : 4.7;
-            lblEstimate.Text = n + " file — " + (rbDvd9.Checked ? "DVD9" : "DVD5") + " " + (rbNtsc.Checked ? "NTSC" : "PAL") + " — a qualità massima ci stanno ~" + (rbDvd9.Checked ? "2 h" : "1 h") + ", oltre il bitrate scende da solo";
+            double total = Items.Sum(x => Math.Max(0, x.Duration));
+            bool unknown = Items.Any(x => x.Duration < 0);
+            string disc = (rbDvd9.Checked ? "DVD9" : "DVD5") + " " + (rbNtsc.Checked ? "NTSC" : "PAL");
+            if (unknown || total <= 0) { lblEstimate.Text = n + " file — " + disc + " — leggo le durate..."; return; }
+            double cap = (rbDvd9.Checked ? 8540000000.0 : 4700000000.0) * 0.96;
+            int kbps = new[] { 0, 8000, 6000, 4500, 3000 }[cbQuality.SelectedIndex];
+            if (kbps == 0) kbps = Math.Min(8000, (int)Math.Floor((cap * 8 / 1000 / total) / 1.04 - 192));
+            string giudizio = kbps >= 6500 ? "ottima" : kbps >= 4500 ? "buona" : kbps >= 3000 ? "discreta" : kbps >= 2000 ? "bassa: valuta DVD9" : "pessima: usa DVD9 o dividi";
+            double sizeGB = (kbps + 192) * 1000.0 / 8 * total * 1.04 / 1e9;
+            lblEstimate.Text = string.Format("{0} file, {1} — {2} — video {3} kbps ({4}) — circa {5:0.0} GB", n, Engine.FormatHms(total), disc, kbps, giudizio, sizeGB);
+            lblEstimate.ForeColor = kbps < 3000 ? Color.Firebrick : Color.DimGray;
         }
 
+        // ------------------------------------------------------------ UI helpers
         void AppendLog(string s)
         {
             if (InvokeRequired) { BeginInvoke((Action)(() => AppendLog(s))); return; }
@@ -362,21 +516,38 @@ namespace Mp4ToDvd
             running = on;
             foreach (Control c in Controls) SetEnabledDeep(c, !on);
             btnCancel.Enabled = on;
+            btnCopyLog.Enabled = true;
             txtLog.Enabled = true; prg.Enabled = true; lblStatus.Enabled = true;
-            if (!on) { prg.Style = ProgressBarStyle.Continuous; Text = "mp4todvd"; }
+            if (!on)
+            {
+                prg.Style = ProgressBarStyle.Continuous; Text = "mp4todvd";
+                btnBurnAgain.Enabled = engine.LastDvdDir != null && cbDrive.Items.Count > 0 && !cbDrive.Items[0].ToString().StartsWith("(");
+                SetThreadExecutionState(ES_CONTINUOUS);
+            }
+            else
+            {
+                btnBurnAgain.Enabled = false;
+                SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);   // niente standby durante il lavoro
+            }
         }
         void SetEnabledDeep(Control c, bool en)
         {
-            if (c == txtLog || c == prg || c == lblStatus || c == btnCancel) return;
+            if (c == txtLog || c == prg || c == lblStatus || c == btnCancel || c == btnCopyLog) return;
             if (c.HasChildren) foreach (Control k in c.Controls) SetEnabledDeep(k, en);
-            if (c is Button || c is RadioButton || c is CheckBox || c is ComboBox || c is TextBox || c is ListBox) c.Enabled = en;
+            if (c is Button || c is RadioButton || c is CheckBox || c is ComboBox || c is TextBox || c is ListBox || c is NumericUpDown) c.Enabled = en;
+        }
+
+        void Notify()
+        {
+            try { SystemSounds.Asterisk.Play(); } catch { }
+            try { if (!ContainsFocus) FlashWindow(Handle, true); } catch { }
         }
 
         Job BuildJob()
         {
             return new Job
             {
-                Files = lstFiles.Items.Cast<string>().ToList(),
+                Files = Items.Select(x => x.Path).ToList(),
                 Dvd9 = rbDvd9.Checked,
                 Ntsc = rbNtsc.Checked,
                 Aspect = rbAsp169.Checked ? "16:9" : rbAsp43.Checked ? "4:3" : "auto",
@@ -387,38 +558,60 @@ namespace Mp4ToDvd
                 ChapterMinutes = new[] { 5, 10, 15, 100000 }[cbChapters.SelectedIndex],
                 DriveIndex = cbDrive.SelectedIndex,
                 BurnSpeedX = new[] { 0, 2, 4, 6, 8, 12, 16 }[cbSpeed.SelectedIndex],
+                Copies = (int)numCopies.Value,
                 Source = cbSource.SelectedIndex,
                 Mode = rbIso.Checked ? OutputMode.Iso : rbFolder.Checked ? OutputMode.Folder : OutputMode.Burn,
                 OutputPath = rbIso.Checked ? txtIso.Text : txtFolder.Text,
+                Menu = new MenuOptions { Enabled = chkMenu.Checked && chkMenu.Enabled, Template = cbMenuTemplate.SelectedIndex, Title = txtMenuTitle.Text, BackgroundImage = txtMenuBg.Text },
             };
         }
 
         void ShowPreview()
         {
             if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
-            string file = lstFiles.SelectedItem as string ?? (string)lstFiles.Items[0];
+            string file = (lstFiles.SelectedItem as FileItem ?? Items.First()).Path;
             var job = BuildJob();
             using (var f = new PreviewForm(engine, job, file)) f.ShowDialog(this);
         }
 
-        // ------------------------------------------------------------ run
-        void Start()
+        void ShowMenuPreview()
         {
             if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
             var job = BuildJob();
-            if (job.Mode == OutputMode.Iso && string.IsNullOrWhiteSpace(job.OutputPath)) { MessageBox.Show(this, "Indica dove salvare la ISO.", "mp4todvd"); return; }
-            if (job.Mode == OutputMode.Folder && string.IsNullOrWhiteSpace(job.OutputPath)) { MessageBox.Show(this, "Indica la cartella di destinazione.", "mp4todvd"); return; }
-            if (job.Mode == OutputMode.Burn && Engine.ListRecorders().Count == 0) { MessageBox.Show(this, "Nessun masterizzatore trovato: scegli ISO o cartella.", "mp4todvd"); return; }
+            if (job.Menu.Template == 4 && !File.Exists(job.Menu.BackgroundImage)) { MessageBox.Show(this, "Scegli un'immagine di sfondo valida.", "mp4todvd"); return; }
+            string dir = Path.Combine(Path.GetTempPath(), "mp4todvd_menuprev_" + Guid.NewGuid().ToString("N"));
+            try
+            {
+                var r = engine.RenderMenuPreview(job, dir);
+                using (var bmp = MenuBuilder.Compose(r, 0))
+                using (var f = new Form { Text = "Anteprima menu — " + MenuBuilder.Templates[job.Menu.Template], StartPosition = FormStartPosition.CenterParent, ClientSize = new Size(r.DisplayW, r.DisplayH + 30), MinimizeBox = false, MaximizeBox = false, FormBorderStyle = FormBorderStyle.FixedDialog })
+                {
+                    try { f.Icon = Icon; } catch { }
+                    var pic = new PictureBox { Image = bmp, Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.Black };
+                    var lbl = new Label { Text = "Così apparirà sul TV; la prima voce è evidenziata come farà il telecomando.", Dock = DockStyle.Bottom, Height = 30, TextAlign = ContentAlignment.MiddleCenter, ForeColor = Color.DimGray };
+                    f.Controls.Add(pic); f.Controls.Add(lbl);
+                    f.ShowDialog(this);
+                }
+            }
+            catch (Exception ex) { MessageBox.Show(this, "Anteprima menu fallita: " + ex.Message, "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        }
 
+        // ------------------------------------------------------------ run
+        void PrepareEngineCallbacks()
+        {
             engine.Log = AppendLog;
             engine.Progress = SetProgress;
             engine.AskInsertDisc = msg =>
             {
                 DialogResult r = DialogResult.Cancel;
-                Invoke((Action)(() => r = MessageBox.Show(this, msg, "mp4todvd — inserisci il disco", MessageBoxButtons.OKCancel, MessageBoxIcon.Information)));
+                Invoke((Action)(() => { Notify(); r = MessageBox.Show(this, msg, "mp4todvd — inserisci il disco", MessageBoxButtons.OKCancel, MessageBoxIcon.Information); }));
                 return r == DialogResult.OK;
             };
+        }
 
+        void RunJob(Func<string> work, string doneTitle)
+        {
             txtLog.Clear();
             SetRunning(true);
             SetProgress(-1, "Avvio...");
@@ -426,7 +619,7 @@ namespace Mp4ToDvd
             Task.Run(() =>
             {
                 string result = null; Exception error = null;
-                try { result = engine.Execute(job); }
+                try { result = work(); }
                 catch (OperationCanceledException) { }
                 catch (Exception ex) { error = ex; }
                 BeginInvoke((Action)(() =>
@@ -436,17 +629,40 @@ namespace Mp4ToDvd
                     {
                         AppendLog("[OK] " + result.Replace("\n", " "));
                         SetProgress(1, "Fatto in " + sw.Elapsed.ToString(@"h\:mm\:ss"));
-                        MessageBox.Show(this, result, "mp4todvd — fatto", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        Notify();
+                        MessageBox.Show(this, result + "\n\nTempo: " + sw.Elapsed.ToString(@"h\:mm\:ss"), doneTitle, MessageBoxButtons.OK, MessageBoxIcon.Information);
                     }
                     else if (error != null)
                     {
                         AppendLog("[ERRORE] " + error.Message);
                         SetProgress(0, "Errore");
+                        Notify();
                         MessageBox.Show(this, error.Message, "mp4todvd — errore", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     }
                     else { AppendLog("Annullato."); SetProgress(0, "Annullato"); }
                 }));
             });
+        }
+
+        void Start()
+        {
+            if (lstFiles.Items.Count == 0) { MessageBox.Show(this, "Aggiungi almeno un video.", "mp4todvd", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            var job = BuildJob();
+            if (job.Mode == OutputMode.Iso && string.IsNullOrWhiteSpace(job.OutputPath)) { MessageBox.Show(this, "Indica dove salvare la ISO.", "mp4todvd"); return; }
+            if (job.Mode == OutputMode.Folder && string.IsNullOrWhiteSpace(job.OutputPath)) { MessageBox.Show(this, "Indica la cartella di destinazione.", "mp4todvd"); return; }
+            if (job.Mode == OutputMode.Burn && Engine.ListRecorders().Count == 0) { MessageBox.Show(this, "Nessun masterizzatore trovato: scegli ISO o cartella.", "mp4todvd"); return; }
+            if (job.Menu.Enabled && job.Menu.Template == 4 && !File.Exists(job.Menu.BackgroundImage)) { MessageBox.Show(this, "Per il menu con immagine personalizzata scegli un'immagine di sfondo valida.", "mp4todvd"); return; }
+            PrepareEngineCallbacks();
+            RunJob(() => engine.Execute(job), "mp4todvd — fatto");
+        }
+
+        void BurnAgain()
+        {
+            if (engine.LastDvdDir == null) return;
+            int drive = cbDrive.SelectedIndex, speed = new[] { 0, 2, 4, 6, 8, 12, 16 }[cbSpeed.SelectedIndex], copies = (int)numCopies.Value;
+            if (MessageBox.Show(this, "Rimasterizzo l'ultimo DVD pronto (" + (engine.LastLabel ?? "") + ") senza ricodificare.\nInserisci un DVD vergine e premi OK.", "mp4todvd", MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            PrepareEngineCallbacks();
+            RunJob(() => engine.BurnAgain(drive, speed, copies), "mp4todvd — fatto");
         }
     }
 }

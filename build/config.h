@@ -21,3 +21,5 @@
 #define PACKAGE_BUGREPORT "dvdauthor-users@lists.sourceforge.net"
 #define HAVE_SETMODE 1
 #define HAVE_DECL_O_BINARY 1
+#define HAVE_FREETYPE 1
+#define HAVE_FT2BUILD_H 1

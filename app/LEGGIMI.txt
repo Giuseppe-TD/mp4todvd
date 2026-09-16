@@ -1,24 +1,34 @@
-mp4todvd - video -> DVD-Video senza menu (parte appena inserito)
-=================================================================
-Niente da installare: mp4todvd.exe + cartella tools (ffmpeg, dvdauthor).
+mp4todvd - video -> DVD-Video (Windows)
+========================================
+Niente da installare: mp4todvd.exe + cartella tools (ffmpeg, dvdauthor, spumux).
 Serve solo Windows 10/11 (usa il .NET Framework 4.8 gia' incluso).
 
+USO
 1. Apri mp4todvd.exe (o trascina i video sull'exe).
-2. Aggiungi i video (o trascinali nella lista), mettili in ordine.
-3. Scegli DVD5 / DVD9, PAL / NTSC, aspetto, qualita'.
-4. Uscita: masterizza direttamente, oppure crea una ISO, oppure solo la cartella VIDEO_TS.
-5. "Anteprima" mostra un fotogramma come uscira' sul TV (cursore per scegliere il punto).
-6. Avvia. Se masterizzi, ti chiede il DVD vergine quando serve.
+2. Aggiungi i video (trascinali anche nella lista), ordinali con Su/Giu'.
+   Canc rimuove, doppio clic apre l'anteprima. Accanto a ogni file c'e' la durata.
+3. Scegli DVD5/DVD9, PAL/NTSC, sorgente, aspetto, qualita'.
+   La riga sopra "Avvia" dice durata totale, bitrate, giudizio di qualita' e GB stimati.
+4. Menu DVD (opzionale): spunta "Menu con scelta dei video", scegli il template e il titolo.
+   "Anteprima menu" mostra come verra'. Senza menu il disco parte subito.
+5. Uscita: masterizza (con velocita' e numero di copie), crea una ISO, o solo la cartella VIDEO_TS.
+6. "Anteprima" mostra un fotogramma come uscira' sul TV (cursore per scegliere il punto).
+7. Avvia. A lavoro finito senti un suono e l'icona lampeggia.
+   "Rimasterizza ultimo DVD" fa altre copie senza ricodificare (finche' non chiudi il programma).
 
-Qualita' "Auto" calcola il bitrate per riempire il disco scelto: fino a ~1 h su DVD5
-(~2 h su DVD9) sei al massimo (8000 kbps), oltre scende da solo.
-"Due passate" raddoppia il tempo di codifica ma rende meglio sui film lunghi.
-Sorgente:
+SORGENTE
   - "VHS da OBS: lascia com'e' (16:9 con bande)": il fotogramma 1080 resta com'e', bande laterali
     comprese, ridotto a 720x576 (DVD 16:9) e deinterlacciato. E' il default.
-  - "VHS da OBS: ritaglia le bande (4:3)": trova da sola le bande nere, ritaglia, riporta a
-    720x576 in 4:3 e deinterlaccia. Se dentro c'e' un 720x576 non scalato lo tiene interlacciato.
+  - "VHS da OBS: ritaglia le bande (4:3)": trova le bande nere, ritaglia, 720x576 in 4:3, deinterlaccia.
+    Se dentro c'e' un 720x576 non scalato lo tiene interlacciato.
   - "VHS nativa 720x576: interlacciato": file gia' 720x576 dal grabber, DVD interlacciato come l'originale.
   - "VHS: deinterlaccia (yadif)": video progressivo.
   - "Video normale": telefono, PC, download.
-Piu' video = riprodotti in sequenza, con un capitolo ogni N minuti (tasto next).
+
+NOTE
+  Qualita' "Auto" calcola il bitrate per riempire il disco scelto: fino a ~1 h su DVD5
+  (~2 h su DVD9) sei al massimo (8000 kbps), oltre scende da solo.
+  "Due passate" raddoppia il tempo di codifica ma rende meglio sui film lunghi.
+  Piu' video = riprodotti in sequenza, con un capitolo ogni N minuti (tasto next).
+  Durante la conversione il PC non va in standby. Le impostazioni e la finestra si ricordano.
+  Etichetta, ISO e cartella seguono il nome del primo video finche' non le scrivi a mano.

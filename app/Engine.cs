@@ -44,6 +44,8 @@ namespace Mp4ToDvd
         public int DriveIndex;
         public int ChapterMinutes = 5;
         public int BurnSpeedX = 0;         // 0 = massima, altrimenti 2,4,6,8,12,16
+        public MenuOptions Menu = new MenuOptions();
+        public int Copies = 1;             // numero di dischi da masterizzare (stessa VIDEO_TS)
         public int Source = 4;             // 0 video normale, 1 VHS da OBS ritaglia (crop auto + 4:3), 2 VHS nativa 720x576 mantieni interlacciato, 3 VHS deinterlaccia (yadif), 4 VHS da OBS lascia com'è (16:9 con bande, deinterlaccia)
     }
 
@@ -63,6 +65,32 @@ namespace Mp4ToDvd
         readonly string toolsDir;
         Process current;
         volatile bool cancelled;
+
+        public Func<MenuOptions, List<string>, bool, int, string, MenuBuilder.Result> MenuRenderer = MenuBuilder.Render;
+
+        public string LastDvdDir;      // VIDEO_TS dell'ultimo lavoro riuscito (per rimasterizzare senza ricodificare)
+        public string LastLabel;
+        string lastWorkDir;            // cartella temporanea da ripulire (null se l'uscita era una cartella scelta dall'utente)
+
+        public void Cleanup()
+        {
+            try { if (lastWorkDir != null && Directory.Exists(lastWorkDir)) Directory.Delete(lastWorkDir, true); } catch { }
+            lastWorkDir = null; LastDvdDir = null;
+        }
+
+        // durata veloce (una sola chiamata ffprobe) per la lista file
+        public double QuickDuration(string file)
+        {
+            try
+            {
+                var ffprobe = Tool("ffprobe.exe"); if (ffprobe == null) return 0;
+                var d = Capture(ffprobe, "-v error -show_entries format=duration -of csv=p=0 " + Q(file)).Trim();
+                double v; return double.TryParse(d.Split('\n')[0].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0;
+            }
+            catch { return 0; }
+        }
+
+        public static string FormatHms(double sec) => Hms(sec);
 
         public Engine(string toolsDir) { this.toolsDir = toolsDir; }
 
@@ -118,6 +146,38 @@ namespace Mp4ToDvd
             var sb = new StringBuilder();
             Run(exe, args, l => sb.AppendLine(l), null);
             return sb.ToString();
+        }
+
+        // esegue un tool che legge da stdin e scrive su stdout (spumux)
+        void RunPiped(string exe, string args, string inFile, string outFile)
+        {
+            if (cancelled) throw new OperationCanceledException();
+            var psi = new ProcessStartInfo(exe, args) { UseShellExecute = false, CreateNoWindow = true, RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true };
+            var p = new Process { StartInfo = psi };
+            var err = new StringBuilder();
+            p.ErrorDataReceived += (s, e) => { if (e.Data != null) err.AppendLine(e.Data); };
+            current = p;
+            p.Start();
+            p.BeginErrorReadLine();
+            var reader = System.Threading.Tasks.Task.Run(() => { using (var fo = File.Create(outFile)) p.StandardOutput.BaseStream.CopyTo(fo); });
+            using (var fi = File.OpenRead(inFile)) fi.CopyTo(p.StandardInput.BaseStream);
+            p.StandardInput.Close();
+            reader.Wait();
+            p.WaitForExit();
+            current = null;
+            if (cancelled) throw new OperationCanceledException();
+            if (p.ExitCode != 0) throw new Exception(Path.GetFileName(exe) + " ha fallito:\n" + Tail(err.ToString(), 1500));
+        }
+
+        // anteprima del menu (solo rendering, niente ffmpeg)
+        public MenuBuilder.Result RenderMenuPreview(Job job, string dir)
+        {
+            var labels = job.Menu.Labels != null && job.Menu.Labels.Count == job.Files.Count ? job.Menu.Labels : job.Files.Select(MenuBuilder.CleanLabel).ToList();
+            bool wide = job.Aspect == "16:9" || (job.Aspect == "auto" && job.Source != 1);   // stima: OBS com'è e video normali 16:9, ritaglio 4:3
+            if (job.Aspect == "auto" && job.Source == 2) wide = false;
+            int H = job.Ntsc ? 480 : 576;
+            var mo = new MenuOptions { Enabled = true, Template = job.Menu.Template, Title = string.IsNullOrWhiteSpace(job.Menu.Title) ? job.Label : job.Menu.Title, BackgroundImage = job.Menu.BackgroundImage };
+            return MenuRenderer(mo, labels, wide, H, dir);
         }
 
         // ------------------------------------------------------------ probe
@@ -282,6 +342,8 @@ namespace Mp4ToDvd
             var ffmpeg = Tool("ffmpeg.exe") ?? throw new Exception("ffmpeg.exe non trovato nella cartella tools");
             var dvdauthor = Tool("dvdauthor.exe") ?? throw new Exception("dvdauthor.exe non trovato nella cartella tools");
             if (job.Files.Count == 0) throw new Exception("nessun file");
+            bool withMenu = job.Menu != null && job.Menu.Enabled;
+            string spumux = withMenu ? (Tool("spumux.exe") ?? throw new Exception("spumux.exe non trovato nella cartella tools (serve per il menu)")) : null;
 
             string fmt = job.Ntsc ? "ntsc" : "pal";
             int W = 720, H = job.Ntsc ? 480 : 576;
@@ -315,9 +377,26 @@ namespace Mp4ToDvd
             Log(string.Format("Totale {0} -> {1} {2}, {3}, video {4} kbps, audio AC3 {5} kbps{6}{7}", Hms(total), fmt.ToUpper(), aspect, job.Dvd9 ? "DVD9" : "DVD5", vkbps, audioKbps, job.TwoPass ? ", 2 passate" : "",
                 job.Source == 4 ? ", VHS da OBS com'è" : job.Source == 1 ? ", VHS da OBS ritagliata" : job.Source == 2 ? ", sorgente interlacciata mantenuta" : job.Source == 3 ? ", deinterlacciato (yadif)" : ""));
 
+            // spazio libero: mpg intermedio + VOB (+ ISO se richiesta), con margine
+            double estBytes = (vkbps + audioKbps) * 1000.0 / 8 * total * 1.05;
+            double needBytes = estBytes * 2 + (job.Mode == OutputMode.Iso ? estBytes : 0);
+            try
+            {
+                var root = Path.GetPathRoot(Path.GetFullPath(job.WorkDir));
+                if (!string.IsNullOrEmpty(root) && root.Length <= 3)
+                {
+                    var di = new DriveInfo(root);
+                    if (di.IsReady && di.AvailableFreeSpace < needBytes)
+                        throw new Exception(string.Format("Spazio insufficiente su {0}: liberi {1:0.0} GB, servono circa {2:0.0} GB. Cambia la cartella di lavoro o libera spazio.", root, di.AvailableFreeSpace / 1e9, needBytes / 1e9));
+                }
+            }
+            catch (Exception ex) when (!(ex.Message.StartsWith("Spazio insufficiente"))) { }
+
+            Cleanup();
             var work = job.WorkDir;
             if (Directory.Exists(work)) Directory.Delete(work, true);
             Directory.CreateDirectory(work);
+            if (job.Mode != OutputMode.Folder) lastWorkDir = work;
             string dvdDir = job.Mode == OutputMode.Folder ? job.OutputPath : Path.Combine(work, "DVD");
             if (Directory.Exists(dvdDir))
             {
@@ -326,9 +405,22 @@ namespace Mp4ToDvd
                 Directory.Delete(dvdDir);
             }
 
-            // ---- codifica
+            // ---- codifica (con tempo residuo stimato sull'intero lavoro)
             var vobs = new List<Tuple<string, string>>();
             double doneSec = 0;
+            var encClock = Stopwatch.StartNew();
+            var rawProgress = Progress;
+            Progress = (f, st) =>
+            {
+                if (f > 0.02 && f < 1)
+                {
+                    double eta = encClock.Elapsed.TotalSeconds * (1 - f) / f;
+                    st += "  —  restano ~" + Hms(eta);
+                }
+                rawProgress(f, st);
+            };
+            try
+            {
             for (int n = 0; n < probes.Count; n++)
             {
                 var p = probes[n];
@@ -386,18 +478,73 @@ namespace Mp4ToDvd
                 for (int t = job.ChapterMinutes * 60; t < p.Duration - 10; t += job.ChapterMinutes * 60) ch.Add(Hms(t));
                 vobs.Add(Tuple.Create(outFile, string.Join(",", ch)));
             }
+            }
+            finally { Progress = rawProgress; }
+
+            // ---- menu (opzionale)
+            string menuMpg = null; MenuBuilder.Result menu = null; var chapterStart = new List<int>();
+            {
+                int ch = 1;
+                foreach (var v in vobs) { chapterStart.Add(ch); ch += v.Item2.Split(',').Length; }
+            }
+            if (withMenu)
+            {
+                Progress(-1, "Creo il menu...");
+                string mdir = Path.Combine(work, "menu");
+                var labels = job.Menu.Labels != null && job.Menu.Labels.Count == job.Files.Count ? job.Menu.Labels : job.Files.Select(MenuBuilder.CleanLabel).ToList();
+                if (job.Files.Count > MenuBuilder.MaxItems) Log("[!] Più di " + MenuBuilder.MaxItems + " video: nel menu compaiono solo i primi " + MenuBuilder.MaxItems + " (gli altri si raggiungono con Riproduci tutto).");
+                var mo = new MenuOptions { Enabled = true, Template = job.Menu.Template, Title = string.IsNullOrWhiteSpace(job.Menu.Title) ? job.Label : job.Menu.Title, BackgroundImage = job.Menu.BackgroundImage };
+                menu = MenuRenderer(mo, labels, wide, H, mdir);
+                Log("Menu: template \"" + MenuBuilder.Templates[Math.Max(0, Math.Min(MenuBuilder.Templates.Length - 1, job.Menu.Template))] + "\", " + menu.Buttons.Count + " voci");
+
+                // sfondo -> MPEG-2 fermo immagine con audio muto (stessi parametri video dei titoli)
+                string menuBg = Path.Combine(mdir, "menu_bg.mpg");
+                var err = new StringBuilder();
+                int code = Run(ffmpeg, string.Format("-y -hide_banner -loglevel error -loop 1 -framerate {0} -i {1} -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 -t 2 -target {2}-dvd -vf {3} -aspect {4} -r {0} -g {5} -c:a ac3 -b:a 192k -shortest -f dvd {6}",
+                    fps, Q(menu.BgPng), fmt, Q(string.Format("scale=720:{0},setsar={1}", H, sar)), aspect, gop, Q(menuBg)), null, l => err.AppendLine(l));
+                if (code != 0 || !File.Exists(menuBg)) throw new Exception("ffmpeg ha fallito sul menu:\n" + err);
+
+                // pulsanti (spumux)
+                var spu = new StringBuilder();
+                spu.AppendLine("<subpictures><stream><spu start=\"00:00:00.00\" highlight=\"" + Esc(menu.HlPng) + "\" select=\"" + Esc(menu.SelPng) + "\" force=\"yes\">");
+                for (int i = 0; i < menu.Buttons.Count; i++)
+                {
+                    var b = menu.Buttons[i];
+                    int up = (i - 1 + menu.Buttons.Count) % menu.Buttons.Count, down = (i + 1) % menu.Buttons.Count;
+                    spu.AppendLine(string.Format("  <button name=\"b{0}\" x0=\"{1}\" y0=\"{2}\" x1=\"{3}\" y1=\"{4}\" up=\"b{5}\" down=\"b{6}\" left=\"b{5}\" right=\"b{6}\"/>", i + 1, b.X, b.Y, b.X + b.Width, b.Y + b.Height, up + 1, down + 1));
+                }
+                spu.AppendLine("</spu></stream></subpictures>");
+                string spuXml = Path.Combine(mdir, "spu.xml");
+                File.WriteAllText(spuXml, spu.ToString(), new UTF8Encoding(false));
+                menuMpg = Path.Combine(mdir, "menu.mpg");
+                RunPiped(spumux, "-v 0 " + Q(spuXml), menuBg, menuMpg);
+                if (!File.Exists(menuMpg) || new FileInfo(menuMpg).Length < 1000) throw new Exception("spumux ha fallito (menu)");
+            }
 
             // ---- authoring
             Progress(-1, "Authoring DVD (dvdauthor)...");
             var xml = new StringBuilder();
             xml.AppendLine("<dvdauthor dest=\"" + Esc(dvdDir) + "\">");
-            xml.AppendLine("  <vmgm><fpc>jump title 1;</fpc></vmgm>");
-            xml.AppendLine("  <titleset><titles>");
+            xml.AppendLine(withMenu ? "  <vmgm><fpc>jump titleset 1 menu;</fpc></vmgm>" : "  <vmgm><fpc>jump title 1;</fpc></vmgm>");
+            xml.AppendLine("  <titleset>");
+            if (withMenu)
+            {
+                xml.AppendLine("  <menus>");
+                xml.AppendLine("    <video format=\"" + fmt + "\" aspect=\"" + aspect + "\"" + (wide ? " widescreen=\"nopanscan\"" : "") + "/>");
+                xml.AppendLine("    <audio format=\"ac3\" lang=\"it\"/>");
+                xml.AppendLine("    <pgc entry=\"root\">");
+                xml.AppendLine("      <vob file=\"" + Esc(menuMpg) + "\" pause=\"inf\"/>");
+                for (int i = 0; i < menu.Buttons.Count; i++)
+                    xml.AppendLine("      <button name=\"b" + (i + 1) + "\">jump title 1" + (i == 0 ? "" : " chapter " + chapterStart[Math.Min(i - 1, chapterStart.Count - 1)]) + ";</button>");
+                xml.AppendLine("    </pgc>");
+                xml.AppendLine("  </menus>");
+            }
+            xml.AppendLine("  <titles>");
             xml.AppendLine("    <video format=\"" + fmt + "\" aspect=\"" + aspect + "\"" + (wide ? " widescreen=\"nopanscan\"" : "") + "/>");
             xml.AppendLine("    <audio format=\"ac3\" lang=\"it\"/>");
             xml.AppendLine("    <pgc>");
             foreach (var v in vobs) xml.AppendLine("      <vob file=\"" + Esc(v.Item1) + "\" chapters=\"" + v.Item2 + "\"/>");
-            xml.AppendLine("      <post>exit;</post>");
+            xml.AppendLine(withMenu ? "      <post>call menu;</post>" : "      <post>exit;</post>");
             xml.AppendLine("    </pgc>");
             xml.AppendLine("  </titles></titleset>");
             xml.AppendLine("</dvdauthor>");
@@ -435,17 +582,40 @@ namespace Mp4ToDvd
                     result = "ISO creata: " + job.OutputPath + "\nTasto destro > Masterizza immagine disco.";
                     break;
                 default:
-                    RunSta(() => Burn(dvdDir, label, job.DriveIndex, job.BurnSpeedX));
-                    result = "DVD masterizzato.";
+                    int copies = Math.Max(1, job.Copies);
+                    for (int c = 1; c <= copies; c++)
+                    {
+                        if (copies > 1) Log(string.Format("Copia {0} di {1}", c, copies));
+                        if (c > 1 && !AskInsertDisc(string.Format("Copia {0} di {1}: inserisci un altro DVD vergine e premi OK.", c, copies))) throw new OperationCanceledException();
+                        RunSta(() => Burn(dvdDir, label, job.DriveIndex, job.BurnSpeedX));
+                    }
+                    result = copies > 1 ? copies + " DVD masterizzati." : "DVD masterizzato.";
                     break;
             }
-            try { if (job.Mode != OutputMode.Folder) Directory.Delete(work, true); else { foreach (var f in Directory.GetFiles(work)) File.Delete(f); Directory.Delete(work); } } catch { }
+            LastDvdDir = dvdDir; LastLabel = label;
+            try { if (job.Mode == OutputMode.Folder) { foreach (var f in Directory.GetFiles(work)) File.Delete(f); Directory.Delete(work); } } catch { }
             Progress(1, "Fatto");
             return result;
         }
 
         const double DVD1X = 692.5;   // settori/s a 1x DVD (1385 KiB/s)
         static string SpeedX(int sectorsPerSec) => (sectorsPerSec / DVD1X).ToString("0.#", CultureInfo.InvariantCulture);
+
+        // rimasterizza l'ultima VIDEO_TS senza ricodificare
+        public string BurnAgain(int driveIndex, int speedX, int copies)
+        {
+            cancelled = false;
+            if (LastDvdDir == null || !File.Exists(Path.Combine(LastDvdDir, "VIDEO_TS", "VIDEO_TS.IFO"))) throw new Exception("Non c'è nessun DVD pronto da rimasterizzare: fai prima una conversione.");
+            copies = Math.Max(1, copies);
+            for (int c = 1; c <= copies; c++)
+            {
+                if (copies > 1) Log(string.Format("Copia {0} di {1}", c, copies));
+                if (c > 1 && !AskInsertDisc(string.Format("Copia {0} di {1}: inserisci un altro DVD vergine e premi OK.", c, copies))) throw new OperationCanceledException();
+                RunSta(() => Burn(LastDvdDir, LastLabel ?? "DVD_VIDEO", driveIndex, speedX));
+            }
+            Progress(1, "Fatto");
+            return copies > 1 ? copies + " DVD masterizzati." : "DVD masterizzato.";
+        }
 
         // IMAPI2 è COM "apartment": oggetti ed eventi devono vivere su un thread STA, altrimenti le notifiche di avanzamento non arrivano
         static void RunSta(Action a)
