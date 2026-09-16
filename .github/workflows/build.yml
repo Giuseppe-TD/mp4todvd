@@ -22,7 +22,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dvdauthor-exe
-          path: build/out/dvdauthor.exe
+          path: build/out/*.exe
 
   app:
     name: mp4todvd.exe + pacchetto
